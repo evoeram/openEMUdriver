@@ -1,0 +1,61 @@
+; openEMUdriver.inf — bind E-MU USB audio interfaces to Microsoft WinUSB
+; so the openEMUdriver ASIO DLL can stream isochronous audio in user mode.
+;
+; SPDX-License-Identifier: LGPL-2.1-or-later
+; Only Microsoft-provided WinUSB is referenced — no kernel binaries in this package.
+
+[Version]
+Signature="$Windows NT$"
+Class=USB
+ClassGUID={36fc9e60-c465-11cf-8056-444553540000}
+Provider=%Provider%
+CatalogFile=openemu.cat
+DriverVer=10/01/2025,1.0.0.0
+; PnpLockdown=1          (dev build: unsigned local INF)
+
+[Manufacturer]
+%Manufacturer%=OpenEMU,NTamd64
+
+[OpenEMU.NTamd64]
+; Whole-device binding (no usbccgp split — CA0189 answers class requests
+; only when a single WinUSB owns the configuration).
+%EMU0202%=OED_Install, USB\VID_041E&PID_3F02
+%EMU0404%=OED_Install, USB\VID_041E&PID_3F04
+%TRACKER%=OED_Install, USB\VID_041E&PID_3F0A
+%EMU0204%=OED_Install, USB\VID_041E&PID_3F0C
+
+[OED_Install.Include]
+; (placeholder section; real one below)
+
+[OED_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+AddReg  = OED_AddReg
+
+[OED_Install.HW]
+AddReg = OED_HWReg
+
+[OED_Install.Services]
+AddService = WinUSB,0x00000002,WinUSB_ServiceInstall
+
+[WinUSB_ServiceInstall]
+DisplayName   = %WinUSB_SvcDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WinUSB.sys
+
+[OED_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x00010008,"{9D1A2C31-4E6F-5B7A-8C21-3DE46FA5B708}"
+
+[OED_HWReg]
+; nothing yet
+
+[Strings]
+Provider      = "openEMUdriver project"
+Manufacturer  = "openEMUdriver project"
+WinUSB_SvcDesc = "WinUSB — openEMUdriver transport"
+EMU0202       = "E-MU 0202 USB (openEMUdriver)"
+EMU0404       = "E-MU 0404 USB (openEMUdriver)"
+TRACKER       = "E-MU Tracker Pre USB (openEMUdriver)"
+EMU0204       = "E-MU 0204 USB (openEMUdriver)"

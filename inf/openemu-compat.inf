@@ -1,0 +1,98 @@
+; openemu-compat.inf — "WASAPI mode": bind the whole E-MU USB device to the
+; inbox usbaudio.sys so Windows creates normal audio endpoints (WASAPI/MME).
+; The CA0189 declares vendor-class (0xFF) interfaces but carries standard UAC1
+; class-specific descriptors, which usbaudio.sys parses fine.
+;
+; SPDX-License-Identifier: LGPL-2.1-or-later
+; In this mode openEMUdriver's direct-USB ASIO is unavailable (device is owned
+; by usbaudio.sys). Switch back with inf\openemu.inf ("ASIO mode").
+
+[Version]
+Signature="$Windows NT$"
+Class=MEDIA
+ClassGUID={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+CatalogFile=openemu-compat.cat
+DriverVer=10/01/2025,1.0.0.0
+
+[Manufacturer]
+%Manufacturer%=OpenEMU,NTamd64
+
+[OpenEMU.NTamd64]
+%EMU0202%=EMUSBAUDIO, USB\VID_041E&PID_3F02
+%EMU0404%=EMUSBAUDIO, USB\VID_041E&PID_3F04
+%TRACKER%=EMUSBAUDIO, USB\VID_041E&PID_3F0A
+%EMU0204%=EMUSBAUDIO, USB\VID_041E&PID_3F0C
+
+[EMUSBAUDIO]
+Include=ks.inf, wdmaudio.inf
+Needs=KS.Registration, WDMAUDIO.Registration
+AddReg=EMUSBAUDIO.AddReg
+
+[EMUSBAUDIO.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,redbook"
+HKR,,Driver,,usbaudio.sys
+HKR,,NTMPDriver,,"usbaudio.sys"
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%EMU0404%
+HKR,Drivers\midi\wdmaud.drv,Description,,%EMU0404%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%EMU0404%
+
+[EMUSBAUDIO.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_Wave%,  EMUSBAUDIO.Interface.Wave
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_Wave%, EMUSBAUDIO.Interface.Wave
+AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_Wave%,EMUSBAUDIO.Interface.Wave
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_Midi%,  EMUSBAUDIO.Interface.Midi
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_Midi%, EMUSBAUDIO.Interface.Midi
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_Topology%,EMUSBAUDIO.Interface.Topo
+
+[EMUSBAUDIO.Interface.Wave]
+AddReg=EMUSBAUDIO.Interface.Wave.AddReg
+[EMUSBAUDIO.Interface.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%WaveName%
+
+[EMUSBAUDIO.Interface.Midi]
+AddReg=EMUSBAUDIO.Interface.Midi.AddReg
+[EMUSBAUDIO.Interface.Midi.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%MidiName%
+
+[EMUSBAUDIO.Interface.Topo]
+AddReg=EMUSBAUDIO.Interface.Topo.AddReg
+[EMUSBAUDIO.Interface.Topo.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%TopoName%
+
+[EMUSBAUDIO.Services]
+AddService = usbaudio, 0x00000002, EMUSBAUDIO.ServiceInstall
+
+[EMUSBAUDIO.ServiceInstall]
+DisplayName   = %SvcDesc%
+ServiceType   = 1                  ; SERVICE_KERNEL_DRIVER
+StartType     = 3                  ; SERVICE_DEMAND_START
+ErrorControl  = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\usbaudio.sys
+
+[Strings]
+Provider     = "openEMUdriver project"
+Manufacturer = "openEMUdriver project"
+Proxy.CLSID  = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO    ="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER   ="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE  ="{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSNAME_Wave    ="Wave"
+KSNAME_Midi    ="Midi"
+KSNAME_Topology="Topology"
+WaveName ="E-MU USB Audio (openEMUdriver compat)"
+MidiName ="E-MU USB MIDI (openEMUdriver compat)"
+TopoName ="E-MU USB Mixer (openEMUdriver compat)"
+SvcDesc  ="USB Audio Class Driver (usbaudio.sys) — openEMUdriver compat mode"
+EMU0202  ="E-MU 0202 USB"
+EMU0404  ="E-MU 0404 USB"
+TRACKER  ="E-MU Tracker Pre USB"
+EMU0204  ="E-MU 0204 USB"
