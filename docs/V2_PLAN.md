@@ -227,7 +227,7 @@ output достаточного размера — иначе `STATUS_INVALID_PA
 | Этап | Содержание | Критерий готовности |
 | --- | --- | --- |
 | M0. База и воспроизводимость | ✅ сделано 2026-11-04 (см. «Итог M0»): v1 tag'ом; убрать локальные пути из сборки (поиск тулчейна вместо MSBuild-проекта — `.vcxproj` из сэмпла ещё не подключены); отдельный signing-скрипт; восстановить или удалить ссылки на `ref/`; сохранять descriptor dumps | Чистая машина собирает v1 и smoke/v2 по инструкции — **выполнено на новой машине без WDK** |
-| M1. PnP-каркас 0404 | 🟡 2026-11-04: каркас написан и упакован (см. «Итог M1») — `driver/emuusbaudio/Emu/{emu.h,emu_driver.cpp,emu_pnp.cpp}`, `inf/openemu-ks.inf`, `driver/kinstall.ps1`, `driver/ksoak.ps1`. `PcAddAdapterDevice`, device context, remove lock, start/stop/remove/surprise-remove. Без аудио | 50 циклов disable/enable и remove/replug под Driver Verifier без утечек и BSOD — **не выполнено**: на этой машине нет 0404 и нет админ-прав; прогон §9 `docs/BUILD.md` на тестовой машине |
+| M1. PnP-каркас 0404 | 🟡 каркас написан и упакован (см. «Итог M1»); **критерий выполнен 2026-11-05**: 50 disable/enable + 10 remove/replug под Driver Verifier (Special Pool, IRQL, DDI compliance) — ни одного BSOD/дампа, ни медленных циклов, ни ошибок в System-логе (см. «Ksoak M2»); замечание по pool-дельте +1.1..1.7 МБ не монотонно — фоновый шум живой машины | 50 циклов disable/enable и remove/replug под Driver Verifier без утечек и BSOD — **выполнено** |
 | M2. USB + управление | Выбор конфигурации, parser capabilities, EP0 SET_CUR, кэш состояния, версионные IOCTL, безопасная регистрация device interface. **База проверена 2026-11-04**: USB-API доступено и линкуется (см. «Подготовка M2»); парсер дескрипторов + плановый тест №1 готовы (см. «Парсер дескрипторов и плановый тест №1»), сборка EP0-запросов и её тест — тоже (см. «Контрольные запросы EP0»), транспорт class-запросов и read-only пробник clock-rate встроены в `StartDevice` (см. «этап 2»; на нём же держится кэш состояния — `Emu/emu_desc.{h,cpp}` вопросы по частотам/alt, `Emu/emu_state.{h,cpp}` кэш и его тест, см. «этап 3»); набор операций и раскладка ответов описаны кодом и тестом («этап 4a»), обработчик `IRP_MJ_DEVICE_CONTROL` + `IoRegisterDeviceInterface` + `.Interfaces` в INF написаны («этап 4b»); **старт на живой 0404 состоялся** (см. «Железный прогон M2»), парсер выправлен по реальному дескриптору, фикстура заменена дампом; CreateFile решён этапом 4c — контрольное устройство `\\.\EmuUSBAudioCtl`, `emu-probe: PASS` на железе (первый IOCTL-roundtrip); GET_CUR-пробник отвечает 0xC000000D (разбирается), реальной отправки `SET_CUR` и выбора конфигурации нет | Панель отдельно меняет rate/clock/S/PDIF/soft limit; WinUSB одновременно не открывается |
 | M3. Kernel ISO без PortCLS | Временный test-only IOCTL для 48 kHz stereo render/capture: URB-кольцо, StartFrame, статистика ошибок | Синус на OUT и loopback capture работают независимо от PortCLS; тестовый интерфейс удалён из release |
 | M4. Минимальный WaveRT | Только 48 kHz, 2 канала, 24-in-32. Сначала render, затем capture. Реальные буферы вместо ToneGenerator, USB-позиция, notifications | WASAPI render и capture + wasapi-test проходят; generator/savedata/timing emulation удалены |
@@ -793,10 +793,17 @@ FORMAT_TYPE_III — теперь помечаются `NonPcm` и пропуск
 `utest.sh` — 4 из 4, 576 проверок. Утверждение RE_NOTES про скрытый class
 байт (0xFF + стандартный subclass) подтвердилось точно.
 
-**GET_CUR clock-rate пробник: 0xC000000D (STATUS_INVALID_PARAMETER)** — не
-stall из v1-протокола, а отказ, который выглядит как отвержение URB самим
-USB-стеком до устройства. Кэш состояния остаётся SET--only. Разбор — на
-следующем трейсе (кандидаты: сборка `_URB_CONTROL_TRANSFER`, флаги, длина).
+**GET_CUR clock-rate пробник: 0xC000000D (STATUS_INVALID_PARAMETER)** —
+корень найден 2026-11-05 по документации и исходникам WDF:
+`URB_FUNCTION_CONTROL_TRANSFER` требует в `PipeHandle` handle **default
+control pipe**, который появляется только после select-configuration
+(WDF-исходник `fxusbdevicekm.cpp` открывает default pipe именно для этого
+поля). SelectConfiguration — отложенный шаг M2, поэтому URB отвергается
+USB-стеком до устройства; кэш состояния остаётся SET-only до него.
+GET_DESCRIPTOR работал без handle, потому что descriptor-URB USBD
+обрабатывает внутренне. Следствие: любой class-запрос EP0 (GET и SET)
+требует этапа SelectConfiguration — это не «отложенное улучшение», а
+обязательное условие всего control-plane.
 
 **Новый блокер: `CreateFile` на interface symbolic link даёт
 ERROR_FILE_NOT_FOUND** при включённом интерфейсе и работающем драйвере. Это
@@ -865,9 +872,27 @@ System-логе, пробник контрольного устройства �
 Driver Verifier (Special Pool, отдельная перезагрузка) на том же соаке.
 Критерий M1 (50 циклов под Verifier) пока не выполнен.
 
-Дальше: Driver Verifier (/standard, перезагрузка, повторный ksoak), разбор
-GET_CUR-пробника (0xC000000D — URB отвергается стеком?) на рабочем канале
-захвата трейса.
+### Ksoak под Driver Verifier (2026-11-05): критерий M1 закрыт
+
+`verifier /standard /driver emuusbaudio.sys` (Special Pool, Force IRQL,
+pool tracking, deadlock detection, DMA, DDI compliance), перезагрузка,
+повторный `ksoak.ps1 -Cycles 50 -RemoveCycles 10`:
+
+- 50/50 disable/enable по ~1.0 с (Verifier-накладные поверх 0.6 с), ни
+  одного медленного цикла;
+- 10/10 remove/re-add; ни одной ошибки emuusbaudio/portcls в System;
+- ни одного BSOD и ни одного дампа в C:\Windows\Minidump;
+- пробник контрольного устройства — PASS после соака;
+- pool-дельта снова не монотонна (+1.7 МБ в тех же границах шума).
+
+Открытый вопрос «интерфейс не включается» из этапа 4b закрыт как ложный:
+`pnputil /enum-interfaces` показывал «Включено» с самого первого пуска,
+настоящий отказ происходил в KS на CREATE (см. этап 4c).
+
+Дальше: **SelectConfiguration** (`USBD_SelectConfigUrbAllocateAndBuild`,
+USBD_INTERFACE_LIST_ENTRY по всем интерфейсам) — обязательное условие
+любого class-запроса EP0, проверяемое на железе тем же GET_CUR-пробником;
+после него — SET_CUR по трейсу и ksoak под Verifier снова.
 Примечание к пробам 4b: root-причина «интерфейс не включается» была
 ложной — pnputil показывал «Включено» с самого начала, настоящий отказ
 происходил в KS на CREATE.
