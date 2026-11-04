@@ -228,7 +228,7 @@ output достаточного размера — иначе `STATUS_INVALID_PA
 | --- | --- | --- |
 | M0. База и воспроизводимость | ✅ сделано 2026-11-04 (см. «Итог M0»): v1 tag'ом; убрать локальные пути из сборки (поиск тулчейна вместо MSBuild-проекта — `.vcxproj` из сэмпла ещё не подключены); отдельный signing-скрипт; восстановить или удалить ссылки на `ref/`; сохранять descriptor dumps | Чистая машина собирает v1 и smoke/v2 по инструкции — **выполнено на новой машине без WDK** |
 | M1. PnP-каркас 0404 | 🟡 каркас написан и упакован (см. «Итог M1»); **критерий выполнен 2026-11-05**: 50 disable/enable + 10 remove/replug под Driver Verifier (Special Pool, IRQL, DDI compliance) — ни одного BSOD/дампа, ни медленных циклов, ни ошибок в System-логе (см. «Ksoak M2»); замечание по pool-дельте +1.1..1.7 МБ не монотонно — фоновый шум живой машины | 50 циклов disable/enable и remove/replug под Driver Verifier без утечек и BSOD — **выполнено** |
-| M2. USB + управление | Выбор конфигурации, parser capabilities, EP0 SET_CUR, кэш состояния, версионные IOCTL, безопасная регистрация device interface. **База проверена 2026-11-04**: USB-API доступено и линкуется (см. «Подготовка M2»); парсер дескрипторов + плановый тест №1 готовы (см. «Парсер дескрипторов и плановый тест №1»), сборка EP0-запросов и её тест — тоже (см. «Контрольные запросы EP0»), транспорт class-запросов и read-only пробник clock-rate встроены в `StartDevice` (см. «этап 2»; на нём же держится кэш состояния — `Emu/emu_desc.{h,cpp}` вопросы по частотам/alt, `Emu/emu_state.{h,cpp}` кэш и его тест, см. «этап 3»); набор операций и раскладка ответов описаны кодом и тестом («этап 4a»), обработчик `IRP_MJ_DEVICE_CONTROL` + `IoRegisterDeviceInterface` + `.Interfaces` в INF написаны («этап 4b»); **старт на живой 0404 состоялся** (см. «Железный прогон M2»), парсер выправлен по реальному дескриптору, фикстура заменена дампом; CreateFile решён этапом 4c — контрольное устройство `\\.\EmuUSBAudioCtl`, `emu-probe: PASS` на железе (первый IOCTL-roundtrip); GET_CUR-пробник отвечает 0xC000000D (разбирается), реальной отправки `SET_CUR` и выбора конфигурации нет | Панель отдельно меняет rate/clock/S/PDIF/soft limit; WinUSB одновременно не открывается |
+| M2. USB + управление | ✅ **выполнено 2026-11-05** (кроме SelectConfiguration/alt — отнесён к M3, стриминг): parser capabilities + кэш состояния + версионные IOCTL + control-DO + полный SET-путь (rate/clock/spdif/softlimit) — всё на живой 0404. GET_CUR не поддержан firmware (stall, как в v1) — кэш SET-only по дизайну. Выбор конфигурации/alt — M3 | Панель отдельно меняет rate/clock/S/PDIF/soft limit — **выполнено** (`emu-probe set-*` на живом устройстве, descriptor/domain vetoes отказывают вне диапазона); WinUSB одновременно не открывается (kernel-драйвер владеет devnode) |
 | M3. Kernel ISO без PortCLS | Временный test-only IOCTL для 48 kHz stereo render/capture: URB-кольцо, StartFrame, статистика ошибок | Синус на OUT и loopback capture работают независимо от PortCLS; тестовый интерфейс удалён из release |
 | M4. Минимальный WaveRT | Только 48 kHz, 2 канала, 24-in-32. Сначала render, затем capture. Реальные буферы вместо ToneGenerator, USB-позиция, notifications | WASAPI render и capture + wasapi-test проходят; generator/savedata/timing emulation удалены |
 | M5. Форматы и full duplex | Все частоты 0404, затем 4 канала 44.1–96 кГц, feedback, external clock, обработка xruns | Все разрешённые сочетания работают; запрещённые (4ch/192k) корректно отклоняются |
@@ -808,6 +808,47 @@ CA0189 не отвечает на GET_CUR (stall). **Кэш состояния �
 пригодившийся ещё и потому, что DebugView 5.02 из winget не работает
 как kernel-капчер на этой машине, а Driver Verifier — см. ниже —
 блокирует kernel-записи в реестр из DriverEntry).
+
+### SET-путь (2026-11-05): контракт, экзекьютор и приём железом
+
+Критерий M2 требует, чтобы панель меняла rate/clock/S-PDIF/soft limit.
+Блокер «нет трейса» снялся иначе: SET-сборщики уже были протестированы
+байт-в-байт против v1-движка (`utest.sh ctrl`), а вердикт железа стал виден
+через кэш состояния — принятый SET_CUR отражается в GET_STATE
+(`ValidMask`/поле/`StateSequence`), отказ — в `LastOperationStatus`.
+
+Контракт дополнен четырьмя кодами записи (0x802..0x805,
+FILE_WRITE_ACCESS — SET отличается от query того же function-кода номером
+кода), вход `EMU_SET_INPUT` (Size/Version/Value, 3 ULONG, C_ASSERT), ответ —
+освежённый `EMU_STATE_INFO` (верdict и значение в одном roundtrip). Правила
+classify: для SET — input >= `sizeof(EMU_SET_INPUT)` (новая панель может
+дописывать хвост), output >= `sizeof(EMU_STATE_INFO)`; «не готов» по-прежнему
+опережает проверки буфера.
+
+В драйвере: `EmuUsbExecuteSet` — вся операция под StateLock (SET против
+SET и SET против stop сериализованы; GET_STATE читатели ждут control-
+transfer — миллисекунды — вместо половины применённого изменения).
+Descriptor-veto до шины: rate, которого нет в дескрипторе, и SET для
+отсутствующего юнита отказываются без roundtrip. Кэш дополнили
+домен-проверки трёх байтовых контролов (clock 0/1, spdif 0/1/2,
+softlimit 0/1) — правило то же: отказ не трогает значение и sequence.
+`LastOperationStatus` живёт в контексте под тем же StateLock и
+сбрасывается в release (операция принадлежит мёртвой сессии).
+
+Пробник (`emu-probe set-rate/set-clock/set-spdif/set-softlimit`) —
+замена панели для приёмки. **Результат на живой 0404:** SET_RATE 48000 и
+96000 — приняты (rate в GET_STATE, sequence 1→2), SET_CLOCK_SOURCE 1 —
+принят, SET_SOFT_LIMIT 1 — принят, SET_SPDIF_FORMAT 1 и 2 — приняты;
+SET_RATE 44101 и SET_SPDIF_FORMAT 3 — отказы descriptor/domain-veto до
+шины с нетронутым кэшем. Единственное отклонение: SET_SPDIF_FORMAT 0
+("none") firmware отказывает (0xC0000001) — значение из v1-протокола,
+которое железо не берёт; зафиксировано как деталь протокола.
+
+Инфраструктурный факт того же вечера: kernel-образ драйвера НЕ
+перегружается restart-device/disable/remove — только загрузкой ОС. Все
+пост-бутные инсталлы меняли файл на диске, но исполнялся образ последней
+загрузки; диагностировалось по ImplementedMask (0x03 у старого образа
+против 0x3F у нового).
 
 **Новый блокер: `CreateFile` на interface symbolic link даёт
 ERROR_FILE_NOT_FOUND** при включённом интерфейсе и работающем драйвере. Это

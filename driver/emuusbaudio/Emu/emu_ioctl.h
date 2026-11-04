@@ -54,6 +54,36 @@ DEFINE_GUID(GUID_DEVINTERFACE_EMUUSBAUDIO,
 #define EMU_IOCTL_GET_STATE     CTL_CODE(EMU_IOCTL_BASE, 0x801, METHOD_BUFFERED, \
                                          FILE_READ_ACCESS)
 
+// The four write operations of the CA0189 control plane (stage: SET path).
+// FILE_WRITE_ACCESS distinguishes them from the queries of the same function
+// code — a SET is a different control code number, exactly as the classify
+// test insists. Every SET carries an EMU_SET_INPUT and answers with the
+// refreshed EMU_STATE_INFO, so the panel sees the accepted value and the
+// operation status in one roundtrip.
+#define EMU_IOCTL_SET_RATE          CTL_CODE(EMU_IOCTL_BASE, 0x802, METHOD_BUFFERED, \
+                                             FILE_WRITE_ACCESS)
+#define EMU_IOCTL_SET_CLOCK_SOURCE  CTL_CODE(EMU_IOCTL_BASE, 0x803, METHOD_BUFFERED, \
+                                             FILE_WRITE_ACCESS)
+#define EMU_IOCTL_SET_SPDIF_FORMAT  CTL_CODE(EMU_IOCTL_BASE, 0x804, METHOD_BUFFERED, \
+                                             FILE_WRITE_ACCESS)
+#define EMU_IOCTL_SET_SOFT_LIMIT    CTL_CODE(EMU_IOCTL_BASE, 0x805, METHOD_BUFFERED, \
+                                             FILE_WRITE_ACCESS)
+
+// The SET input stage: the value only, never a unit id, control selector or
+// length — those stay the driver's business. Size/Version first, like every
+// structure here, so a panel built against a newer driver is still readable.
+// Value meaning is per operation: rate in Hz, clock source 0/1, digital
+// output format 0/1/2, soft limit 0/1.
+typedef struct _EMU_SET_INPUT {
+    ULONG Size;                    // sizeof(EMU_SET_INPUT)
+    ULONG Version;                 // EMU_IOCTL_VERSION
+    ULONG Value;
+} EMU_SET_INPUT, *PEMU_SET_INPUT;
+
+// Layout discipline shared with the two replies: ULONG-only, no pointer, no
+// 64-bit scalar, so the 32-bit and 64-bit panel see the same bytes.
+C_ASSERT(sizeof(EMU_SET_INPUT) == 3 * sizeof(ULONG));
+
 // Operation bits. SupportedMask says what the device's descriptor could back;
 // ImplementedMask says what this driver build answers. The panel may only offer
 // a control that is set in both - one number each, and neither is a guess about
@@ -66,7 +96,13 @@ DEFINE_GUID(GUID_DEVINTERFACE_EMUUSBAUDIO,
 #define EMU_OP_SET_SOFT_LIMIT    0x00000020
 #define EMU_OP_GET_STREAM_STATS  0x00000040
 
-#define EMU_OP_IMPLEMENTED       (EMU_OP_GET_CAPS | EMU_OP_GET_STATE)
+// This build answers all four SET operations as well. The hardware verdict
+// that unlocked them: the v1 WinUSB engine has driven these exact requests on
+// the same firmware for years, and the wire layout is asserted byte-for-byte
+// in driver/utest.sh ctrl.
+#define EMU_OP_IMPLEMENTED       (EMU_OP_GET_CAPS | EMU_OP_GET_STATE | \
+                                  EMU_OP_SET_RATE | EMU_OP_SET_CLOCK_SOURCE | \
+                                  EMU_OP_SET_SPDIF_FORMAT | EMU_OP_SET_SOFT_LIMIT)
 
 // ValidMask bits of the state reply: which of the four controls the driver
 // actually confirmed. A clear bit means the field holds EMU_NO_VALUE, and it is
@@ -150,6 +186,10 @@ typedef enum _EMU_IOCTL_ACTION {
     EmuIoctlForward = 0,
     EmuIoctlGetCaps,
     EmuIoctlGetState,
+    EmuIoctlSetRate,
+    EmuIoctlSetClockSource,
+    EmuIoctlSetSpdifFormat,
+    EmuIoctlSetSoftLimit,
     EmuIoctlReject       // ours, but refused; Status says why
 } EMU_IOCTL_ACTION;
 

@@ -76,8 +76,38 @@ static NTSTATUS EmuCompleteQuery(
         }
         ExReleaseFastMutex(&Ctx->StateLock);
     } else {
-        // GET_STATE reads only the cache and the counters; LastOperation
-        // is 0 because no SET exists in this build's contract yet.
+        // GET_STATE and all four SET operations answer with the state
+        // snapshot. The SETs read their EMU_SET_INPUT from this same buffer
+        // first - METHOD_BUFFERED hands us the input stage right here, and
+        // the reply overwrites it - then run the request through
+        // EmuUsbExecuteSet, which serializes against other SETs and stops
+        // under the state lock and records the outcome for LastOperation-
+        // Status. A refused or failed SET still completes STATUS_SUCCESS:
+        // the IOCTL worked, and the verdict travels in the state reply
+        // (LastOperationStatus plus whatever ValidMask shows), which is what
+        // that contract field exists for.
+        EMU_IOCTL_ACTION action = Decision->Action;
+        ULONG value = 0;
+
+        if (action != EmuIoctlGetState) {
+            PEMU_SET_INPUT input = (PEMU_SET_INPUT)reply;
+
+            if (input->Size != sizeof(EMU_SET_INPUT) ||
+                input->Version != EMU_IOCTL_VERSION) {
+                // A caller speaking a different dialect of the contract is
+                // refused before anything reaches the device.
+                Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+                Irp->IoStatus.Information = 0;
+                status = STATUS_INVALID_PARAMETER;
+                IoCompleteRequest(Irp, IO_NO_INCREMENT);
+                return status;
+            }
+            value = input->Value;
+            status = EmuUsbExecuteSet(Ctx, action, value);
+        } else {
+            status = STATUS_SUCCESS;
+        }
+
         ULONG state = (ULONG)InterlockedCompareExchange(&Ctx->State, 0, 0);
         ExAcquireFastMutex(&Ctx->StateLock);
         EmuIoctlFillState((PEMU_STATE_INFO)reply, &Ctx->Settings,
@@ -85,7 +115,7 @@ static NTSTATUS EmuCompleteQuery(
                           Ctx->StartCount,
                           Ctx->StopCount,
                           Ctx->RemoveCount,
-                          (NTSTATUS)0);
+                          Ctx->LastOperationStatus);
         ExReleaseFastMutex(&Ctx->StateLock);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = Decision->OutputBytes;

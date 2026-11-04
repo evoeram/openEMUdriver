@@ -133,6 +133,48 @@ static void CaseNoteRateWithoutCaps(void)
 
 // The sequence is what makes a change visible to a reader that polls: it counts
 // the notes the cache accepted, and nothing else moves it.
+
+// The three byte controls are domain-checked, not descriptor-checked: a value
+// outside the domain is refused unchanged and does not move the sequence,
+// exactly like a rate the descriptor contradicts. The accepted ones record
+// and move it, and a rejected note after an accepted one leaves the value
+// alone (a failed SET is the more likely explanation for a bogus byte).
+static void CaseNoteByteControls(void)
+{
+    g_case = "note-byte-controls";
+    EMU_SETTINGS s;
+    static EMU_DEVICE_CAPS caps;
+
+    CHECK(Parse0404(&caps));
+    EmuSettingsInit(&s);
+
+    CHECK(EmuSettingsNoteClockSource(&s, 0));
+    CHECK(EmuSettingsNoteClockSource(&s, 1));
+    CHECK(!EmuSettingsNoteClockSource(&s, 2));
+    CHECK(!EmuSettingsNoteClockSource(&s, 255));
+    CHECK_EQ(s.ClockSource, 1u);
+    CHECK_EQ(s.Sequence, 2u);
+
+    CHECK(EmuSettingsNoteSpdifFormat(&s, 1));
+    CHECK(EmuSettingsNoteSpdifFormat(&s, 2));
+    CHECK(!EmuSettingsNoteSpdifFormat(&s, 3));
+    CHECK_EQ(s.SpdifFormat, 2u);
+    CHECK_EQ(s.Sequence, 4u);
+
+    CHECK(EmuSettingsNoteSoftLimit(&s, 1));
+    CHECK(!EmuSettingsNoteSoftLimit(&s, 2));
+    CHECK_EQ(s.SoftLimit, 1u);
+    CHECK_EQ(s.Sequence, 5u);
+
+    // The four controls are independent: a rejected note on one control does
+    // not disturb the value another control holds.
+    CHECK(!EmuSettingsNoteRate(&s, &caps, 44101));
+    CHECK(!EmuSettingsNoteSoftLimit(&s, 7));
+    CHECK_EQ(s.SpdifFormat, 2u);
+    CHECK_EQ(s.ClockSource, 1u);
+    CHECK_EQ(s.SoftLimit, 1u);
+}
+
 static void CaseSequenceCountsAcceptedNotes(void)
 {
     g_case = "sequence";
@@ -175,6 +217,7 @@ main(void)
 
     CaseInitUnknown();
     CaseNoteRate();
+    CaseNoteByteControls();
     CaseNoteRateContinuous();
     CaseNoteRateWithoutCaps();
     CaseSequenceCountsAcceptedNotes();

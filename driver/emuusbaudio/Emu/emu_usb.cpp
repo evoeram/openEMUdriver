@@ -275,6 +275,91 @@ EmuUsbProbeClockRate(
                   unitId, (unsigned)index, rate);
 }
 
+NTSTATUS
+EmuUsbExecuteSet(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ EMU_IOCTL_ACTION       Action,
+    _In_ ULONG                  Value
+    )
+{
+    EMU_CTRL_REQUEST request;
+    ULONG            unitId;
+    NTSTATUS         status;
+
+    PAGED_CODE();
+
+    ExAcquireFastMutex(&Ctx->StateLock);
+
+    switch (Action) {
+    case EmuIoctlSetRate:
+        // The descriptor gets a veto before anything reaches the wire: a rate
+        // it does not carry is refused without a bus roundtrip.
+        if (!EmuCapsSupportsRate(Ctx->Caps, Value)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        unitId = EmuCapsXuUnitId(Ctx->Caps, EMU_XU_CLOCK_RATE);
+        status = EmuCtrlBuildClockRateSet(&request, unitId,
+                                          Ctx->Caps->AcInterfaceNumber, Value);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        status = EmuUsbSendControl(Ctx, &request, request.Payload);
+        if (NT_SUCCESS(status)) {
+            (VOID)EmuSettingsNoteRate(&Ctx->Settings, Ctx->Caps, Value);
+        }
+        break;
+
+    case EmuIoctlSetClockSource:
+        unitId = EmuCapsXuUnitId(Ctx->Caps, EMU_XU_CLOCK_SOURCE);
+        status = EmuCtrlBuildClockSourceSet(&request, unitId,
+                                            Ctx->Caps->AcInterfaceNumber, Value);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        status = EmuUsbSendControl(Ctx, &request, request.Payload);
+        if (NT_SUCCESS(status)) {
+            (VOID)EmuSettingsNoteClockSource(&Ctx->Settings, Value);
+        }
+        break;
+
+    case EmuIoctlSetSpdifFormat:
+        unitId = EmuCapsXuUnitId(Ctx->Caps, EMU_XU_DIGITAL_IO);
+        status = EmuCtrlBuildSpdifFormatSet(&request, unitId,
+                                            Ctx->Caps->AcInterfaceNumber, Value);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        status = EmuUsbSendControl(Ctx, &request, request.Payload);
+        if (NT_SUCCESS(status)) {
+            (VOID)EmuSettingsNoteSpdifFormat(&Ctx->Settings, Value);
+        }
+        break;
+
+    case EmuIoctlSetSoftLimit:
+        unitId = EmuCapsXuUnitId(Ctx->Caps, EMU_XU_DEVICE_OPTIONS);
+        status = EmuCtrlBuildSoftLimitSet(&request, unitId,
+                                          Ctx->Caps->AcInterfaceNumber,
+                                          Value != 0 ? TRUE : FALSE);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        status = EmuUsbSendControl(Ctx, &request, request.Payload);
+        if (NT_SUCCESS(status)) {
+            (VOID)EmuSettingsNoteSoftLimit(&Ctx->Settings, Value);
+        }
+        break;
+
+    default:
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+
+    Ctx->LastOperationStatus = status;
+    ExReleaseFastMutex(&Ctx->StateLock);
+    return status;
+}
+
 // Mirror the clock-rate probe outcome into the service key's Parameters
 // values. The probe result decides whether the settings cache fills from reads
 // or only from SET_CUR, and on a machine without working kernel-debug capture
@@ -554,7 +639,9 @@ EmuUsbRelease(
     }
     // The controls live in the device, and the device is no longer reachable,
     // so the cache goes back to "nothing is known" with it. Whatever a later
-    // start finds out again comes from a read or from its own SET_CUR.
+    // start finds out again comes from a read or from its own SET_CUR. The
+    // last SET operation belongs to the dead session too.
     EmuSettingsInit(&Ctx->Settings);
+    Ctx->LastOperationStatus = 0;
     ExReleaseFastMutex(&Ctx->StateLock);
 }

@@ -31,3 +31,50 @@ EmuSettingsNoteRate(
     Settings->Sequence++;
     return TRUE;
 }
+
+// The three byte controls have no descriptor table to contradict them, so the
+// rule here is the domain: a value outside it is refused without touching the
+// cache (and without being sent), exactly like a rate the descriptor does not
+// carry. These note functions are called after a SET_CUR the device accepted -
+// the accepted-note sequence moves only on values the device actually took.
+BOOLEAN
+EmuSettingsNoteClockSource(
+    _Inout_ PEMU_SETTINGS Settings,
+    _In_ ULONG Source
+    )
+{
+    if (Source > 1) {
+        return FALSE;
+    }
+    Settings->ClockSource = Source;
+    Settings->Sequence++;
+    return TRUE;
+}
+
+BOOLEAN
+EmuSettingsNoteSpdifFormat(
+    _Inout_ PEMU_SETTINGS Settings,
+    _In_ ULONG Format
+    )
+{
+    if (Format > 2) {
+        return FALSE;
+    }
+    Settings->SpdifFormat = Format;
+    Settings->Sequence++;
+    return TRUE;
+}
+
+BOOLEAN
+EmuSettingsNoteSoftLimit(
+    _Inout_ PEMU_SETTINGS Settings,
+    _In_ ULONG Enabled
+    )
+{
+    if (Enabled > 1) {
+        return FALSE;
+    }
+    Settings->SoftLimit = Enabled;
+    Settings->Sequence++;
+    return TRUE;
+}

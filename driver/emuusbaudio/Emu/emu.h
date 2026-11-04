@@ -135,6 +135,10 @@ typedef struct _EMU_DEVICE_CONTEXT {
     // writer of the "nothing is known" state, and EmuUsbRelease calls it because
     // a released device leaves no evidence behind.
     EMU_SETTINGS                  Settings;
+    // NTSTATUS of the last SET the panel attempted (0 = none yet). Written
+    // under StateLock next to the cache it describes, reset on release:
+    // after the device is gone the operation belongs to a dead session.
+    NTSTATUS                      LastOperationStatus;
 } EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
 // Stage 4c: the panel talks to a driver-owned control device object, not to
@@ -198,6 +202,22 @@ EmuUsbRelease(
 // Submit one built class request on endpoint zero and wait for it. Payload is
 // the data stage: filled for a device-to-host request, sent for a
 // host-to-device one, NULL when there is none.
+// Execute one SET operation end to end: build the CA0189 class request for
+// the contract action, send it on endpoint zero, note the accepted value in
+// the cache and record the outcome for GET_STATE. PASSIVE_LEVEL only - the
+// send waits on the bus - and the whole operation runs under StateLock, so
+// SET against SET and SET against a stop are serialized and GET_STATE
+// readers wait for a control transfer (milliseconds) instead of seeing a
+// half-applied change. The descriptor gets a veto before anything reaches
+// the wire: a rate it does not carry, or a SET for a unit the device does
+// not have, is refused without a bus roundtrip.
+NTSTATUS
+EmuUsbExecuteSet(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ EMU_IOCTL_ACTION       Action,
+    _In_ ULONG                  Value
+    );
+
 VOID
 EmuNoteProbeResult(
     _In_ PEMU_DEVICE_CONTEXT Ctx,

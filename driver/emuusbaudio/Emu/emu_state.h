@@ -62,4 +62,27 @@ EmuSettingsNoteRate(
     _In_ ULONG RateHz
     );
 
+// The three byte controls, noted after a SET_CUR the device accepted. A value
+// outside the control's domain is refused unchanged, exactly like a rate the
+// descriptor contradicts: the caller validates before sending, the cache
+// validates again, and the accepted-note sequence moves only on accepted
+// values. IRQL: any - domain checks and one ULONG store.
+BOOLEAN
+EmuSettingsNoteClockSource(
+    _Inout_ PEMU_SETTINGS Settings,
+    _In_ ULONG Source          // 0 internal, 1 S/PDIF
+    );
+
+BOOLEAN
+EmuSettingsNoteSpdifFormat(
+    _Inout_ PEMU_SETTINGS Settings,
+    _In_ ULONG Format          // 0 none, 1 S/PDIF, 2 AES
+    );
+
+BOOLEAN
+EmuSettingsNoteSoftLimit(
+    _Inout_ PEMU_SETTINGS Settings,
+    _In_ ULONG Enabled         // 0 off, 1 on
+    );
+
 #endif // _EMU_STATE_H_

@@ -1,4 +1,4 @@
-// emu-probe — user-mode client for the EmuUSBAudio control device (M2 4c).
+﻿// emu-probe — user-mode client for the EmuUSBAudio control device (M2 4c).
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // The panel does not exist yet; this tool is its stand-in for the hardware run.
@@ -14,6 +14,8 @@
 #define WIN32_NO_STATUS        // STATUS_* must come from ntstatus.h, not winnt.h
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "emu_ioctl.h"
 
 static const char* PnpStateName(ULONG s)
@@ -129,6 +131,47 @@ static void PrintWin32Error(const char* what, DWORD err)
     }
 }
 
+// One SET roundtrip: input stage in, refreshed state out. The verdict is the
+// state reply itself - LastOperationStatus for the device answer and the
+// field for the requested control (FieldOffset into EMU_STATE_INFO), which
+// shows whether the cache took the value (a refused value stays unknown or
+// keeps its old one).
+static int DoSet(HANDLE h, ULONG code, ULONG value, const char* name,
+                 ULONG fieldOffset)
+{
+    EMU_SET_INPUT in;
+    EMU_STATE_INFO state;
+    DWORD got;
+    ULONG seen;
+
+    in.Size = sizeof(in);
+    in.Version = EMU_IOCTL_VERSION;
+    in.Value = value;
+    if (!DeviceIoControl(h, code, &in, sizeof(in),
+                         &state, sizeof(state), &got, NULL)) {
+        PrintWin32Error(name, GetLastError());
+        return 1;
+    }
+    if (got != sizeof(state)) {
+        printf("%s returned %lu bytes, expected %lu\n", name,
+               (unsigned long)got, (unsigned long)sizeof(state));
+        return 1;
+    }
+    printf("%s %lu -> last op status 0x%08X\n", name, value,
+           state.LastOperationStatus);
+    PrintState(&state);
+    if (state.LastOperationStatus != 0) {
+        printf("%s: device did not accept the value\n", name);
+        return 1;
+    }
+    seen = *(ULONG*)((PUCHAR)&state + fieldOffset);
+    if (seen != value) {
+        printf("%s: cache holds %lu, want %lu\n", name, seen, value);
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     HANDLE h;
@@ -158,6 +201,31 @@ int main(int argc, char** argv)
     }
 
     printf("control device opened\n");
+
+    if (argc >= 2) {
+        ULONG value = (argc >= 3) ? strtoul(argv[2], NULL, 0) : 0;
+        int r;
+        if (!strcmp(argv[1], "set-rate")) {
+            r = DoSet(h, EMU_IOCTL_SET_RATE, value, "SET_RATE",
+                      offsetof(EMU_STATE_INFO, RateHz));
+        } else if (!strcmp(argv[1], "set-clock")) {
+            r = DoSet(h, EMU_IOCTL_SET_CLOCK_SOURCE, value, "SET_CLOCK_SOURCE",
+                      offsetof(EMU_STATE_INFO, ClockSource));
+        } else if (!strcmp(argv[1], "set-spdif")) {
+            r = DoSet(h, EMU_IOCTL_SET_SPDIF_FORMAT, value, "SET_SPDIF_FORMAT",
+                      offsetof(EMU_STATE_INFO, SpdifFormat));
+        } else if (!strcmp(argv[1], "set-softlimit")) {
+            r = DoSet(h, EMU_IOCTL_SET_SOFT_LIMIT, value, "SET_SOFT_LIMIT",
+                      offsetof(EMU_STATE_INFO, SoftLimit));
+        } else {
+            printf("unknown subcommand %s; reading state only\n", argv[1]);
+            r = -1;
+        }
+        if (r >= 0) {
+            CloseHandle(h);
+            return r;
+        }
+    }
 
     memset(&caps, 0, sizeof(caps));
     if (!DeviceIoControl(h, EMU_IOCTL_GET_CAPS, NULL, 0,

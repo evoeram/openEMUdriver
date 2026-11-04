@@ -125,6 +125,66 @@ static void CaseBufferRules(void)
     CheckStatus("caps-short", STATUS_BUFFER_TOO_SMALL, d.Status);
     CHECK_EQ(d.OutputBytes, 0u);
 
+    // The state query's input rule doubles as the boundary between queries and
+    // writes: GET_STATE with an input stage is refused (it would mean a
+    // dialect this build does not speak), while the SET codes REQUIRE it.
+    Decide(&d, EMU_IOCTL_GET_STATE, TRUE, 4, sizeof(EMU_STATE_INFO));
+    CheckStatus("state-with-input", STATUS_INVALID_PARAMETER, d.Status);
+}
+
+// The four SET operations: fixed EMU_SET_INPUT stage in, refreshed
+// EMU_STATE_INFO out. The access bits make a SET a different control code
+// number from the query on the same function code, and the reply size is the
+// state structure for every one of them - the panel sees the accepted value
+// and LastOperationStatus in one roundtrip.
+static void CaseSetRules(void)
+{
+    g_case = "set-rules";
+    EMU_IOCTL_DECISION d;
+    const ULONG codes[] = {EMU_IOCTL_SET_RATE, EMU_IOCTL_SET_CLOCK_SOURCE,
+                           EMU_IOCTL_SET_SPDIF_FORMAT, EMU_IOCTL_SET_SOFT_LIMIT};
+    const EMU_IOCTL_ACTION actions[] = {EmuIoctlSetRate, EmuIoctlSetClockSource,
+                                        EmuIoctlSetSpdifFormat,
+                                        EmuIoctlSetSoftLimit};
+
+    for (ULONG i = 0; i < 4; i++) {
+        Decide(&d, codes[i], TRUE, sizeof(EMU_SET_INPUT),
+               sizeof(EMU_STATE_INFO));
+        CHECK_EQ(d.Action, actions[i]);
+        CheckStatus("set-exact", STATUS_SUCCESS, d.Status);
+        CHECK_EQ(d.OutputBytes, sizeof(EMU_STATE_INFO));
+
+        // A bigger stage is read only as far as this build's fields; a bigger
+        // output is the usual append-only compatibility.
+        Decide(&d, codes[i], TRUE, sizeof(EMU_SET_INPUT) + 64,
+               sizeof(EMU_STATE_INFO) + 4096);
+        CHECK_EQ(d.Action, actions[i]);
+        CHECK_EQ(d.OutputBytes, sizeof(EMU_STATE_INFO));
+
+        // A short input stage cannot carry Size/Version - refused before the
+        // device is touched.
+        Decide(&d, codes[i], TRUE, sizeof(EMU_SET_INPUT) - 1,
+               sizeof(EMU_STATE_INFO));
+        CheckStatus("set-short-input", STATUS_INVALID_PARAMETER, d.Status);
+
+        // No output stage means the verdict (LastOperationStatus) would not
+        // reach the caller - refused too.
+        Decide(&d, codes[i], TRUE, sizeof(EMU_SET_INPUT), 0);
+        CheckStatus("set-no-output", STATUS_BUFFER_TOO_SMALL, d.Status);
+
+        // Not ready beats everything else, exactly like the queries.
+        Decide(&d, codes[i], FALSE, sizeof(EMU_SET_INPUT),
+               sizeof(EMU_STATE_INFO));
+        CHECK_EQ(d.Action, EmuIoctlReject);
+        CheckStatus("set-not-ready", STATUS_DEVICE_NOT_READY, d.Status);
+    }
+
+    // Same function code with query access bits is a different control code -
+    // the SET is not a query with an input stage, and the query is not a SET.
+    Decide(&d, CTL_CODE(EMU_IOCTL_BASE, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS),
+           TRUE, sizeof(EMU_SET_INPUT), sizeof(EMU_STATE_INFO));
+    CHECK_EQ(d.Action, EmuIoctlForward);
+
     Decide(&d, EMU_IOCTL_GET_STATE, TRUE, 0, sizeof(EMU_STATE_INFO) - 4);
     CheckStatus("state-short", STATUS_BUFFER_TOO_SMALL, d.Status);
     Decide(&d, EMU_IOCTL_GET_CAPS, TRUE, 0, 0);
@@ -417,6 +477,7 @@ main(void)
     CaseForward();
     CaseNotReady();
     CaseBufferRules();
+    CaseSetRules();
     CaseUsable();
     CaseCapsFill0404();
     CaseCapsFillSparse();

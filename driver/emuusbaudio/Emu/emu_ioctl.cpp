@@ -29,6 +29,18 @@ EmuIoctlClassify(
     } else if (Call->ControlCode == EMU_IOCTL_GET_STATE) {
         action = EmuIoctlGetState;
         required = sizeof(EMU_STATE_INFO);
+    } else if (Call->ControlCode == EMU_IOCTL_SET_RATE) {
+        action = EmuIoctlSetRate;
+        required = sizeof(EMU_SET_INPUT);
+    } else if (Call->ControlCode == EMU_IOCTL_SET_CLOCK_SOURCE) {
+        action = EmuIoctlSetClockSource;
+        required = sizeof(EMU_SET_INPUT);
+    } else if (Call->ControlCode == EMU_IOCTL_SET_SPDIF_FORMAT) {
+        action = EmuIoctlSetSpdifFormat;
+        required = sizeof(EMU_SET_INPUT);
+    } else if (Call->ControlCode == EMU_IOCTL_SET_SOFT_LIMIT) {
+        action = EmuIoctlSetSoftLimit;
+        required = sizeof(EMU_SET_INPUT);
     } else {
         // Everything else belongs to somebody else and goes back untouched.
         // That is not a courtesy: the FDO is PortCls's, and KS/wdmaud drive it
@@ -50,22 +62,39 @@ EmuIoctlClassify(
         return;
     }
 
-    // Both operations are queries: buffered, no input stage at all. An input
-    // buffer means the caller believes it is sending something this build does
-    // not define, so it is refused instead of silently ignored - the same
-    // argument that keeps unimplemented opcodes out of the header.
-    if (Call->InputBufferLength != 0) {
+    // The queries are buffered with no input stage at all: an input buffer
+    // means the caller believes it is sending something this build does not
+    // define, so it is refused instead of silently ignored - the same argument
+    // that keeps unimplemented opcodes out of the header.
+    if (action == EmuIoctlGetCaps || action == EmuIoctlGetState) {
+        if (Call->InputBufferLength != 0) {
+            Decision->Action = EmuIoctlReject;
+            Decision->Status = STATUS_INVALID_PARAMETER;
+            return;
+        }
+        if (Call->OutputBufferLength < required) {
+            Decision->Action = EmuIoctlReject;
+            Decision->Status = STATUS_BUFFER_TOO_SMALL;
+            return;
+        }
+        Decision->Action = action;
+        Decision->Status = STATUS_SUCCESS;
+        Decision->OutputBytes = required;
+        return;
+    }
+
+    // The SET operations: a fixed EMU_SET_INPUT stage in, the refreshed
+    // EMU_STATE_INFO out. A larger input is read only as far as this build's
+    // fields (a newer panel may append), a larger output is fine unread - the
+    // same append-only compatibility the queries offer. The reply carries the
+    // state so the panel sees the accepted value and LastOperationStatus in
+    // one roundtrip instead of guessing and re-reading.
+    if (Call->InputBufferLength < required) {
         Decision->Action = EmuIoctlReject;
         Decision->Status = STATUS_INVALID_PARAMETER;
         return;
     }
-
-    // The reply is the whole structure: a short buffer is refused rather than
-    // partially filled, because half a table is how a panel ends up displaying a
-    // rate the device does not have. A larger buffer is fine and goes unread
-    // past the fields this build writes, which is what lets an older client keep
-    // working against a driver that only ever appends.
-    if (Call->OutputBufferLength < required) {
+    if (Call->OutputBufferLength < sizeof(EMU_STATE_INFO)) {
         Decision->Action = EmuIoctlReject;
         Decision->Status = STATUS_BUFFER_TOO_SMALL;
         return;
@@ -73,7 +102,7 @@ EmuIoctlClassify(
 
     Decision->Action = action;
     Decision->Status = STATUS_SUCCESS;
-    Decision->OutputBytes = required;
+    Decision->OutputBytes = sizeof(EMU_STATE_INFO);
 }
 
 BOOLEAN
