@@ -1,4 +1,4 @@
-// PnP lifecycle for the EmuUSBAudio PortCls FDO. Start brings up the USB client
+﻿// PnP lifecycle for the EmuUSBAudio PortCls FDO. Start brings up the USB client
 // (emu_usb.cpp) and the private control interface (stage 4b); stop and remove
 // take both down again. No audio paths yet.
 // SPDX-License-Identifier: LGPL-2.1-or-later
@@ -31,6 +31,59 @@ extern "C" NTSTATUS AddDevice(
                                   sizeof(EMU_DEVICE_CONTEXT));
 }
 
+// The last control-interface state change, mirrored into the service key's
+// Parameters values. The enable state decides whether a panel can open the
+// device at all, and on a machine without a kernel-debug capture it is the only
+// observable trace of this call; a failure to write the breadcrumb is itself
+// silently ignored (diagnostics must not break the path it diagnoses).
+#pragma code_seg("PAGE")
+static VOID EmuNoteInterfaceState(
+    _In_ PEMU_DEVICE_CONTEXT Context,
+    _In_ BOOLEAN             Enable,
+    _In_ NTSTATUS            Status
+    )
+{
+    HANDLE              keyHandle = NULL;
+    OBJECT_ATTRIBUTES   objectAttributes;
+    UNICODE_STRING      path;
+    WCHAR               pathBuffer[512];
+    UNICODE_STRING      valueName;
+    WCHAR               nameBuffer[] = L"ControlSetState";
+    WCHAR               enabledName[] = L"ControlSetEnabled";
+
+    PAGED_CODE();
+
+    if (EmuDriverRegistryPath.Buffer == NULL) {
+        return;
+    }
+
+    path.Buffer = pathBuffer;
+    path.Length = 0;
+    path.MaximumLength = (USHORT)sizeof(pathBuffer);
+    if (!NT_SUCCESS(RtlAppendUnicodeStringToString(&path,
+                     &EmuDriverRegistryPath)) ||
+        !NT_SUCCESS(RtlAppendUnicodeToString(&path, L"\\Parameters"))) {
+        return;
+    }
+
+    InitializeObjectAttributes(&objectAttributes,
+                               &path,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL,
+                               NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&keyHandle, KEY_SET_VALUE, &objectAttributes))) {
+        return;
+    }
+
+    RtlInitUnicodeString(&valueName, nameBuffer);
+    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &Status, sizeof(Status));
+    RtlInitUnicodeString(&valueName, enabledName);
+    ULONG enabledValue = Enable ? 1 : 0;
+    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &enabledValue,
+                  sizeof(enabledValue));
+    ZwClose(keyHandle);
+}
+
 // Enable or disable the private control interface. Both calls are idempotent:
 // the enabled flag keeps the second disable after an already-disabled interface
 // from touching the registry, and a device that never registered the interface
@@ -47,9 +100,20 @@ static VOID EmuControlInterfaceSet(
 
     if (Context->ControlInterfaceName.Buffer == NULL ||
         Enable == Context->ControlInterfaceEnabled) {
+        EMU_LOG_TERSE(STR_MODULENAME "control interface set-state %lu skipped "
+                      "(name %p, enabled %lu)\n",
+                      (ULONG)Enable, (ULONG_PTR)Context->ControlInterfaceName.Buffer,
+                      (ULONG)Context->ControlInterfaceEnabled);
         return;
     }
     status = IoSetDeviceInterfaceState(&Context->ControlInterfaceName, Enable);
+    // Always logged: the enabled state is the one thing the panel cannot
+    // diagnose from outside, and debug-print capture is not guaranteed on a
+    // test machine. The outcome is mirrored into the service key so a plain
+    // registry read settles what happened.
+    EMU_LOG_TERSE(STR_MODULENAME "control interface set-state %lu -> 0x%x\n",
+                  (ULONG)Enable, status);
+    EmuNoteInterfaceState(Context, Enable, status);
     if (!NT_SUCCESS(status)) {
         // Not a start/stop failure: the registration stands, the device stays
         // up, only the panel cannot open it right now. Verifier and the event

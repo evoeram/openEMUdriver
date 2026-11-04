@@ -1,4 +1,4 @@
-// EmuUSBAudio — UAC1 configuration-descriptor parser (M2).
+﻿// EmuUSBAudio — UAC1 configuration-descriptor parser (M2).
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Everything M2..M5 need to know about the device before a single byte is
@@ -52,7 +52,10 @@ typedef NTSTATUS* PNTSTATUS;
 // an endpoint map that does not match the device.
 #define EMU_MAX_AUDIO_INTERFACES  8
 #define EMU_MAX_TERMINALS        16
-#define EMU_MAX_STREAM_ALTS      24
+// The live 0404 carries 16 render plus 16 capture alts (two bandwidth
+// settings per rate; two more render alts are Type III non-PCM skips); the
+// limit must hold the whole device, not the formats this build streams.
+#define EMU_MAX_STREAM_ALTS      64
 #define EMU_MAX_RATES_PER_ALT     8
 #define EMU_MAX_XU_UNITS          8
 #define EMU_MAX_FEATURE_UNITS     8

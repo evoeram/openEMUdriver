@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   kinstall.ps1 [-Build] [-Uninstall] [-Rollback] [-Sys <path>] [-Inf <path>]
 
@@ -98,7 +98,7 @@ function Remove-OemPackage([string]$infName) {
 
 function Get-EmuDevnode {
     Get-PnpDevice -PresentOnly | Where-Object {
-        $_.InstanceId -like 'USB\VID_041E&PID_3F04' } | Select-Object -First 1
+        $_.InstanceId -like 'USB\VID_041E&PID_3F04*' } | Select-Object -First 1
 }
 
 function Show-Result {

@@ -1,4 +1,4 @@
-// EmuUSBAudio driver entry.
+﻿// EmuUSBAudio driver entry.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #include "emu.h"
 
@@ -93,6 +93,9 @@ extern "C" VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     }
 }
 
+static WCHAR g_RegistryPathBuffer[512];
+UNICODE_STRING EmuDriverRegistryPath;
+
 // INIT: the OS discards this section once the driver is loaded, so DriverEntry
 // must live here (and may call into PAGE, it runs at PASSIVE_LEVEL).
 #pragma code_seg("INIT")
@@ -103,6 +106,16 @@ extern "C" NTSTATUS DriverEntry(
 {
     NTSTATUS status;
 
+    // The path is needed later for the interface breadcrumb; the caller's
+    // buffer is not.
+    if (RegistryPath != NULL && RegistryPath->Buffer != NULL &&
+        RegistryPath->Length / sizeof(WCHAR) < (sizeof(g_RegistryPathBuffer) / sizeof(WCHAR)) - 8) {
+        RtlCopyMemory(g_RegistryPathBuffer, RegistryPath->Buffer, RegistryPath->Length);
+        g_RegistryPathBuffer[RegistryPath->Length / sizeof(WCHAR)] = 0;
+        EmuDriverRegistryPath.Length = RegistryPath->Length;
+        EmuDriverRegistryPath.MaximumLength = (USHORT)sizeof(g_RegistryPathBuffer);
+        EmuDriverRegistryPath.Buffer = g_RegistryPathBuffer;
+    }
     EmuReadTraceLevel(RegistryPath);
 
     status = PcInitializeAdapterDriver(DriverObject,

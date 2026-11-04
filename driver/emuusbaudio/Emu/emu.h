@@ -1,4 +1,4 @@
-// EmuUSBAudio — openEMUdriver v2 kernel driver.
+﻿// EmuUSBAudio — openEMUdriver v2 kernel driver.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // PortCLS adapter for the E-MU USB audio interfaces. M1 was a PnP skeleton; M2
@@ -54,6 +54,11 @@ extern "C" {
 #define EMU_LOG_BLAB(...)  EMU_TRACE(EMU_LEVEL_BLAB,  __VA_ARGS__)
 
 extern ULONG EmuTraceLevel;
+
+// The service key path, copied out of DriverEntry: the PnP manager's
+// buffer is only guaranteed while DriverEntry runs, and the interface
+// breadcrumb below writes into the Parameters subkey long after that.
+extern UNICODE_STRING EmuDriverRegistryPath;
 
 // PnP state of one device instance. Stored as a LONG and written with
 // InterlockedExchange so later stages (IOCTLs, stream threads) can read it

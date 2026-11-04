@@ -1,4 +1,4 @@
-// EmuUSBAudio settings-cache unit test, user-mode.
+﻿// EmuUSBAudio settings-cache unit test, user-mode.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Build and run:  cd driver && ./utest.sh state
@@ -118,8 +118,9 @@ static void CaseNoteRateWithoutCaps(void)
     Block b;
     NTSTATUS status;
 
-    Build0404(b);
-    b[b.size() - 7] = 0;                     // last endpoint claims bLength 0
+    b.assign(Emu0404RealDescriptor,
+             Emu0404RealDescriptor + sizeof(Emu0404RealDescriptor));
+    b[b.size() - 5] = 0;                     // last descriptor claims bLength 0
     status = EmuParseUsbConfigDescriptor(b.data(), (ULONG)b.size(), &caps);
     CheckStatus("parse-fails", STATUS_DATA_ERROR, status);
 

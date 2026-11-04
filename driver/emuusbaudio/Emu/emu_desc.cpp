@@ -1,4 +1,4 @@
-// EmuUSBAudio — UAC1 configuration-descriptor parser implementation.
+﻿// EmuUSBAudio — UAC1 configuration-descriptor parser implementation.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Two passes over one bounded buffer:
@@ -178,10 +178,16 @@ EmuResolveTerminal(_In_ PEMU_PARSE_CTX Ctx, _In_ ULONG TerminalId, _Out_ PULONG 
 {
     for (ULONG i = 0; i < Ctx->TerminalCount; i++) {
         if (Ctx->TerminalId[i] == TerminalId) {
-            // An output terminal consumes host samples (render); an input
-            // terminal feeds the host (capture).
-            *Direction = Ctx->TerminalIsInput[i] ? EMU_STREAM_CAPTURE
-                                                 : EMU_STREAM_RENDER;
+            // bTerminalLink names the terminal where the stream crosses the
+            // unit graph, and the direction follows from which side of the
+            // graph that terminal is on: a host-to-device stream enters the
+            // device through a USB-streaming INPUT terminal, a device-to-host
+            // stream leaves through an OUTPUT terminal. The live 0404 spells
+            // this out plainly — the render interface links terminal 0x01 (an
+            // input terminal), the capture interface terminal 0x0A (an output
+            // terminal).
+            *Direction = Ctx->TerminalIsInput[i] ? EMU_STREAM_RENDER
+                                                 : EMU_STREAM_CAPTURE;
             return STATUS_SUCCESS;
         }
     }
@@ -479,7 +485,13 @@ EmuParseFormatTypeI(_Inout_ PEMU_ALT_STATE Alt, _In_reads_bytes_(Start + Length)
         return STATUS_DATA_ERROR;
     }
     if (d[Start + EMU_FT_FORMATTYPE_OFF] != 1) {
-        return STATUS_DEVICE_CONFIGURATION_ERROR;
+        // FORMAT_TYPE_II/III: PCM-shaped formats this driver does not stream.
+        // Marked like a vendor format tag rather than refused — the live 0404
+        // declares its 16-bit alternate settings as Type III, and failing the
+        // whole device over alts nobody uses would trade a working parse for
+        // nothing.
+        Alt->NonPcm = TRUE;
+        return STATUS_SUCCESS;
     }
     ULONG channels = d[Start + EMU_FT_CHANNELS_OFF];
     ULONG subFrame = d[Start + EMU_FT_SUBFRAME_OFF];

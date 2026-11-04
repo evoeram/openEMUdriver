@@ -311,10 +311,15 @@ EmuUsbLogCaps(_In_ const EMU_DEVICE_CAPS* caps)
 
 // Raw hex, 16 bytes per line. This is the capture path for the parser fixture:
 // with TraceLevel >= 5 the whole descriptor comes out of a live 0404 and
-// docs/descriptors can stop being a reconstruction.
+// docs/descriptors can stop being a reconstruction. The level is a parameter
+// on purpose: the bytes are the evidence for a parse failure too, and the
+// failure branch prints them at ERROR so a machine whose filter mask does not
+// pass BLAB still shows them.
 #pragma code_seg("PAGE")
 static VOID
-EmuUsbDumpDescriptor(_In_reads_bytes_(Length) const UCHAR* Data, _In_ ULONG Length)
+EmuUsbDumpDescriptor(_In_ ULONG Level,
+                     _In_reads_bytes_(Length) const UCHAR* Data,
+                     _In_ ULONG Length)
 {
     static const CHAR digits[] = "0123456789ABCDEF";
     ULONG    offset;
@@ -337,10 +342,10 @@ EmuUsbDumpDescriptor(_In_reads_bytes_(Length) const UCHAR* Data, _In_ ULONG Leng
         }
         line[count * 3] = ANSI_NULL;
         if (first) {
-            EMU_LOG_BLAB(STR_MODULENAME "config descriptor (%lu bytes):\n", Length);
+            EMU_TRACE(Level, STR_MODULENAME "config descriptor (%lu bytes):\n", Length);
             first = FALSE;
         }
-        EMU_LOG_BLAB(STR_MODULENAME "  @%04lu %s\n", offset, line);
+        EMU_TRACE(Level, STR_MODULENAME "  @%04lu %s\n", offset, line);
     }
 }
 
@@ -416,6 +421,11 @@ EmuUsbInitialize(
         goto Exit;
     }
 
+    // Dumped as soon as the bytes are in, whatever the parser then says: the
+    // point of this dump is to capture what a live device really sends, and a
+    // rejecting parser must not hide the evidence.
+    EmuUsbDumpDescriptor(EMU_LEVEL_BLAB, (const UCHAR*)Ctx->ConfigDescriptor, total);
+
     // The caps are published under the state lock, parse included: a panel
     // handle held open across a stop/start can run GET_CAPS while this start
     // rebuilds the table, and a half-parsed Caps is worse than none — the
@@ -433,6 +443,9 @@ EmuUsbInitialize(
     if (!NT_SUCCESS(status)) {
         EMU_LOG_ERROR(STR_MODULENAME "descriptor parse failed, 0x%x (%lu bytes)\n",
                       status, total);
+        // The failing bytes themselves, at ERROR level: whatever filter mask
+        // showed the failure line shows the hex too.
+        EmuUsbDumpDescriptor(EMU_LEVEL_ERROR, (const UCHAR*)Ctx->ConfigDescriptor, total);
         ExReleaseFastMutex(&Ctx->StateLock);
         goto Exit;
     }
@@ -440,7 +453,6 @@ EmuUsbInitialize(
     EmuSettingsInit(&Ctx->Settings);
     ExReleaseFastMutex(&Ctx->StateLock);
     EmuUsbLogCaps(Ctx->Caps);
-    EmuUsbDumpDescriptor((const UCHAR*)Ctx->ConfigDescriptor, total);
     EmuUsbProbeClockRate(Ctx);
 
 Exit:

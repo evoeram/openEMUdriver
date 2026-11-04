@@ -1,4 +1,4 @@
-; openEMUdriver v2 — kernel driver (PortCLS), M1 test-INF.
+﻿; openEMUdriver v2 — kernel driver (PortCLS), M1 test-INF.
 ;
 ; Binds the whole E-MU 0404 USB device to EmuUSBAudio.sys, which is the only
 ; PID this stage is approved for. Whole-device on purpose: the CA0189 firmware
@@ -16,7 +16,7 @@ Class       = Media
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = openemu-ks.cat
-DriverVer   = 11/04/2026,2.0.0.2
+DriverVer   = 11/04/2026,2.0.0.6
 PnpLockdown = 1
 
 [SourceDisksNames]

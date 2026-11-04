@@ -1,4 +1,4 @@
-// EmuUSBAudio descriptor-parser unit test (plan test #1), user-mode.
+﻿// EmuUSBAudio descriptor-parser unit test (plan test #1), user-mode.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Build and run:  cd driver && ./utest.sh
@@ -57,73 +57,99 @@ static void Run(_In_ const char* name, _Inout_ Block& b, _In_ NTSTATUS expected)
     }
 }
 
-// Full parse of the reconstructed 0404 layout, field by field.
+// Full parse of the captured 0404 descriptor, field by field. The expectations
+// are the live device's facts: 18 render plus 16 capture alts, roles declared
+// by protocol with the subclass hidden, four E-MU XUs with codes 0xE301..0xE304
+// (direct monitor and metering do not exist on this firmware), a master-mute
+// feature unit, and a MIDI interface whose descriptors must not disturb the
+// audio parse.
 static void CaseBaseline0404(void)
 {
     g_case = "baseline-0404";
-    Block b;
-    Build0404(b);
 
     static EMU_DEVICE_CAPS caps;
-    NTSTATUS status = EmuParseUsbConfigDescriptor(b.data(), (ULONG)b.size(), &caps);
-    CheckStatus("baseline-0404", STATUS_SUCCESS, status);
-    if (!NT_SUCCESS(status)) {
+    if (!Parse0404(&caps)) {
+        CHECK(FALSE && "Parse0404 failed");
         return;
     }
 
-    CHECK_EQ(caps.DeclaredTotalLength, b.size());
-    CHECK_EQ(caps.BufferLength, b.size());
+    CHECK_EQ(caps.DeclaredTotalLength, 1832u);
+    CHECK_EQ(caps.BufferLength, 1832u);
     CHECK_EQ(caps.ConfigurationValue, 1);
     CHECK(caps.ParsedFlags & EMU_CAPS_AC_FOUND);
-    CHECK(caps.ParsedFlags & EMU_CAPS_VENDOR_CLASS);
     CHECK(caps.ParsedFlags & EMU_CAPS_RENDER);
     CHECK(caps.ParsedFlags & EMU_CAPS_CAPTURE);
     CHECK(caps.ParsedFlags & EMU_CAPS_STATUS_ENDPOINT);
     CHECK(caps.ParsedFlags & EMU_CAPS_HAS_XU);
-    CHECK_EQ(caps.ParsedFlags & EMU_CAPS_NON_PCM_FORMAT, 0);
+    CHECK(caps.ParsedFlags & EMU_CAPS_MIDI_INTERFACE);
+    // The firmware hides the class byte (0xFF) behind standard subclasses —
+    // exactly what RE_NOTES recorded and what the INF binding story assumes.
+    CHECK(caps.ParsedFlags & EMU_CAPS_VENDOR_CLASS);
+    // The 16-bit render alts are FORMAT_TYPE_III on this firmware: recorded as
+    // non-PCM (this build streams 24-in-32 Type I only), never an error.
+    CHECK(caps.ParsedFlags & EMU_CAPS_NON_PCM_FORMAT);
 
     CHECK_EQ(caps.AcInterfaceNumber, 0);
     CHECK_EQ(caps.StatusEndpoint, 0x83);
-    CHECK_EQ(caps.AudioInterfaceCount, 3);
+    CHECK_EQ(caps.AudioInterfaceCount, 4);
     CHECK_EQ(caps.AudioInterfaces[0].Role, EMU_ROLE_AC);
     CHECK_EQ(caps.AudioInterfaces[0].StatusMaxPacket, 2);
-    CHECK_EQ(caps.AudioInterfaces[0].StatusInterval, 1);
+    CHECK_EQ(caps.AudioInterfaces[0].StatusInterval, 10);
     CHECK_EQ(caps.AudioInterfaces[1].Role, EMU_ROLE_AS);
     CHECK_EQ(caps.AudioInterfaces[2].Role, EMU_ROLE_AS);
+    CHECK_EQ(caps.AudioInterfaces[3].Role, EMU_ROLE_MIDI);
 
-    // alt 0 of both streaming interfaces must not be recorded
-    CHECK_EQ(caps.StreamAltCount, 3);
-    CHECK_EQ(EmuCapsAltCount(&caps, EMU_STREAM_RENDER), 2);
-    CHECK_EQ(EmuCapsAltCount(&caps, EMU_STREAM_CAPTURE), 1);
+    // alt 0 of every streaming interface must not be recorded; the MIDI
+    // interface contributes no alts; the two 16-bit Type III alts are skipped
+    // as non-PCM. 16 render + 16 capture remain.
+    CHECK_EQ(caps.StreamAltCount, 32u);
+    CHECK_EQ(EmuCapsAltCount(&caps, EMU_STREAM_RENDER), 16u);
+    CHECK_EQ(EmuCapsAltCount(&caps, EMU_STREAM_CAPTURE), 16u);
 
     PEMU_STREAM_ALT r1 = &caps.StreamAlts[0];
     CHECK_EQ(r1->InterfaceNumber, 1);
     CHECK_EQ(r1->AltSetting, 1);
     CHECK_EQ(r1->Direction, EMU_STREAM_RENDER);
-    CHECK_EQ(r1->TerminalId, 0x03);
+    CHECK_EQ(r1->TerminalId, 0x01);
     CHECK_EQ(r1->FormatTag, 1);
     CHECK_EQ(r1->Channels, 2);
     CHECK_EQ(r1->SubFrameSize, 3);
     CHECK_EQ(r1->BitResolution, 24);
-    CHECK_EQ(r1->RateCount, 6);
+    CHECK_EQ(r1->RateCount, 1);
     CHECK_EQ(r1->Rates[0], 44100);
-    CHECK_EQ(r1->Rates[5], 192000);
-    CHECK_EQ(r1->DataEndpoint, 0x00);           // OUT endpoint 0 on CA0189
-    CHECK_EQ(r1->DataMaxPacket, 1152);
+    CHECK_EQ(r1->DataEndpoint, 0x01);
+    CHECK_EQ(r1->DataMaxPacket, 274);
     CHECK_EQ(r1->DataUsageType, EMU_EP_USAGE_DATA);
     CHECK_EQ(r1->FeedbackEndpoint, 0x81);
     CHECK_EQ(r1->FeedbackMaxPacket, 4);
     CHECK_EQ(r1->RateFlags, 0);
 
+    // The device doubles every rate into a high- and a low-bandwidth alt; the
+    // second 44.1k alt carries the smaller packet bound.
     PEMU_STREAM_ALT r2 = &caps.StreamAlts[1];
     CHECK_EQ(r2->AltSetting, 2);
-    CHECK_EQ(r2->Channels, 4);
-    CHECK_EQ(r2->RateCount, 4);
-    CHECK_EQ(r2->FeedbackEndpoint, EMU_NO_VALUE);
+    CHECK_EQ(r2->Channels, 2);
+    CHECK_EQ(r2->Rates[0], 44100);
+    CHECK_EQ(r2->DataMaxPacket, 142);
+    CHECK_EQ(r2->FeedbackEndpoint, 0x81);
 
-    PEMU_STREAM_ALT c1 = &caps.StreamAlts[2];
+    // 176.4 and 192 kHz exist only as 2ch/24-bit; the highest 4ch rate is 96k.
+    PEMU_STREAM_ALT r192 = &caps.StreamAlts[9];
+    CHECK_EQ(r192->AltSetting, 10);
+    CHECK_EQ(r192->Rates[0], 192000);
+    PEMU_STREAM_ALT r4 = &caps.StreamAlts[10];
+    CHECK_EQ(r4->AltSetting, 11);
+    CHECK_EQ(r4->Channels, 4);
+    CHECK_EQ(r4->Rates[0], 44100);
+
+    // Alts 17/18 (the 16-bit Type III pair) are non-PCM skips, so the capture
+    // table starts right after the render one.
+    PEMU_STREAM_ALT c1 = &caps.StreamAlts[16];
     CHECK_EQ(c1->InterfaceNumber, 2);
+    CHECK_EQ(c1->AltSetting, 1);
     CHECK_EQ(c1->Direction, EMU_STREAM_CAPTURE);
+
+    CHECK_EQ(c1->TerminalId, 0x0A);
     CHECK_EQ(c1->DataEndpoint, 0x82);
     CHECK_EQ(c1->DataUsageType, EMU_EP_USAGE_IMPLICIT_DATA);
     CHECK_EQ(c1->FeedbackEndpoint, EMU_NO_VALUE);
@@ -132,25 +158,36 @@ static void CaseBaseline0404(void)
     CHECK_EQ(caps.MinRateHz, 44100);
     CHECK_EQ(caps.MaxRateHz, 192000);
 
-    CHECK_EQ(caps.XuUnitCount, 6);
-    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_CLOCK_RATE), 0x0A);
-    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_CLOCK_SOURCE), 0x0B);
-    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_DIGITAL_IO), 0x0C);
-    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_DEVICE_OPTIONS), 0x0D);
-    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_DIRECT_MONITOR), 0x0E);
-    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_METERING), 0x0F);
+    CHECK_EQ(caps.XuUnitCount, 4);
+    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_CLOCK_RATE), 0x0C);
+    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_CLOCK_SOURCE), 0x0D);
+    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_DIGITAL_IO), 0x0E);
+    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_DEVICE_OPTIONS), 0x0F);
+    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_DIRECT_MONITOR), EMU_NO_VALUE);
+    CHECK_EQ(EmuCapsXuUnitId(&caps, EMU_XU_METERING), EMU_NO_VALUE);
     CHECK_EQ(EmuCapsXuUnitId(&caps, 0xE3FF), EMU_NO_VALUE);
+    // In descriptor order, not code order: 0x0E carries 0xE303, and the clock
+    // pair is behind it. EmuCapsXuUnitId finds by code regardless.
+    CHECK_EQ(caps.XuUnits[0].UnitID, 0x0E);
+    CHECK_EQ(caps.XuUnits[0].ExtensionCode, EMU_XU_DIGITAL_IO);
+    CHECK_EQ(caps.XuUnits[1].UnitID, 0x0C);
+    CHECK_EQ(caps.XuUnits[1].ExtensionCode, EMU_XU_CLOCK_RATE);
+    CHECK_EQ(caps.XuUnits[2].UnitID, 0x0D);
+    CHECK_EQ(caps.XuUnits[2].ExtensionCode, EMU_XU_CLOCK_SOURCE);
+    CHECK_EQ(caps.XuUnits[3].UnitID, 0x0F);
+    CHECK_EQ(caps.XuUnits[3].ExtensionCode, EMU_XU_DEVICE_OPTIONS);
     for (ULONG i = 0; i < caps.XuUnitCount; i++) {
         CHECK_EQ(caps.XuUnits[i].Layout, EMU_XU_LAYOUT_EMU);
         CHECK_EQ(caps.XuUnits[i].InterfaceNumber, 0);
     }
 
     CHECK_EQ(caps.FeatureUnitCount, 1);
-    CHECK_EQ(caps.FeatureUnits[0].UnitID, 0x02);
+    CHECK_EQ(caps.FeatureUnits[0].UnitID, 0x04);
     CHECK_EQ(caps.FeatureUnits[0].SourceID, 0x01);
-    CHECK_EQ(caps.FeatureUnits[0].ControlSize, 1);
-    CHECK_EQ(caps.FeatureUnits[0].ChannelCount, 2);
-    CHECK_EQ(caps.FeatureUnits[0].MasterControls, 0x03);
+    CHECK_EQ(caps.FeatureUnits[0].ControlSize, 2);
+    CHECK_EQ(caps.FeatureUnits[0].ChannelCount, 4);
+    // The master control is mute only; volume lives on the four channels.
+    CHECK_EQ(caps.FeatureUnits[0].MasterControls, 0x01);
 }
 
 // Standard-class declaration (bInterfaceClass 0x01) must parse identically —
@@ -184,7 +221,7 @@ static void CaseXuBothLayouts(void)
     ConfigStart(b);
     Interface(b, 0, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x01, 0x00);
     AcHeader(b);
-    OutputTerminal(b, 0x03, 0x0301, 2);
+    InputTerminal(b, 0x03, 0x0301, 2);
     XuSpec(b, 0x20, 0x0B00);          // spec layout, non-E-MU code
     XuEmu(b, 0x21, EMU_XU_CLOCK_RATE);
     Interface(b, 1, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x02, 0x00);
@@ -300,7 +337,7 @@ static void CaseXuMalformed(void)
     ConfigStart(b);
     Interface(b, 0, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x01, 0x00);
     AcHeader(b);
-    OutputTerminal(b, 0x03, 0x0301, 2);
+    InputTerminal(b, 0x03, 0x0301, 2);
     Bytes(b, {8, 0x24, 0x08, 0x30, 0x00, 0x00, 0x11, 0x22});   // bNrSources 0, no E-MU code
     Interface(b, 1, 1, 1, EMU_INTERFACE_CLASS_VENDOR, 0x02, 0x00);
     AsGeneral(b, 0x03, 1);
@@ -313,7 +350,7 @@ static void CaseXuMalformed(void)
     ConfigStart(short_xu);
     Interface(short_xu, 0, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x01, 0x00);
     AcHeader(short_xu);
-    OutputTerminal(short_xu, 0x03, 0x0301, 2);
+    InputTerminal(short_xu, 0x03, 0x0301, 2);
     Bytes(short_xu, {5, 0x24, 0x08, 0x30, 0x01});     // cannot hold a unit ID + code
     Interface(short_xu, 1, 1, 1, EMU_INTERFACE_CLASS_VENDOR, 0x02, 0x00);
     AsGeneral(short_xu, 0x03, 1);
@@ -383,7 +420,7 @@ static void CaseMalformed(void)
     Block noAc;
     ConfigStart(noAc);
     Interface(noAc, 0, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x01, 0x00);
-    OutputTerminal(noAc, 0x03, 0x0301, 2);
+    InputTerminal(noAc, 0x03, 0x0301, 2);
     Interface(noAc, 1, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x02, 0x00);
     Interface(noAc, 1, 1, 1, EMU_INTERFACE_CLASS_VENDOR, 0x02, 0x00);
     AsGeneral(noAc, 0x03, 1);
@@ -475,7 +512,7 @@ static void CaseMalformed(void)
     ConfigStart(badFeature);
     Interface(badFeature, 0, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x01, 0x00);
     AcHeader(badFeature);
-    OutputTerminal(badFeature, 0x03, 0x0301, 2);
+    InputTerminal(badFeature, 0x03, 0x0301, 2);
     Bytes(badFeature, {10, 0x24, 0x06, 0x02, 0x01, 0x04});   // bControlSize 4, 3 bytes of controls
     Bytes(badFeature, {0x03, 0x03, 0x03, 0x00});
     Interface(badFeature, 1, 0, 1, EMU_INTERFACE_CLASS_VENDOR, 0x02, 0x00);
@@ -489,7 +526,7 @@ static void CaseMalformed(void)
     ConfigStart(dupXu);
     Interface(dupXu, 0, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x01, 0x00);
     AcHeader(dupXu);
-    OutputTerminal(dupXu, 0x03, 0x0301, 2);
+    InputTerminal(dupXu, 0x03, 0x0301, 2);
     XuEmu(dupXu, 0x0A, EMU_XU_CLOCK_RATE);
     XuEmu(dupXu, 0x0A, EMU_XU_CLOCK_SOURCE);      // same unit ID twice
     Interface(dupXu, 1, 0, 1, EMU_INTERFACE_CLASS_VENDOR, 0x02, 0x00);
@@ -536,7 +573,7 @@ static void CaseOverflowLimits(void)
     ConfigStart(xus);
     Interface(xus, 0, 0, 0, EMU_INTERFACE_CLASS_VENDOR, 0x01, 0x00);
     AcHeader(xus);
-    OutputTerminal(xus, 0x03, 0x0301, 2);
+    InputTerminal(xus, 0x03, 0x0301, 2);
     for (unsigned i = 0; i <= EMU_MAX_XU_UNITS; i++) {
         XuEmu(xus, 0x40 + i, EMU_XU_CLOCK_RATE + (i % 6));
     }
@@ -583,37 +620,46 @@ static void CaseAltLookup(void)
     static EMU_DEVICE_CAPS caps;
     CHECK(Parse0404(&caps));
 
-    // 2ch render: the whole 44.1-192 kHz range lives on alt 1.
+    // Render alt table order: alts 1-10 are 2ch/24-bit (each rate doubled into
+    // a high- and a low-bandwidth alt), alts 11-16 are 4ch, alts 17-18 are
+    // 2ch/16-bit. The lookup must answer with the first alt in descriptor
+    // order, which is what makes the choice reproducible.
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 2, 44100),
+             &caps.StreamAlts[0]);
     CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 2, 48000),
-             &caps.StreamAlts[0]);
+             &caps.StreamAlts[2]);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 2, 96000),
+             &caps.StreamAlts[6]);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 2, 176400),
+             &caps.StreamAlts[8]);
     CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 2, 192000),
-             &caps.StreamAlts[0]);
+             &caps.StreamAlts[9]);
     // 4ch render stops at 96 kHz, and the lookup must not fall back onto the
     // 2ch alt: a caller that asked for four channels and got two would program
     // a frame the device does not have.
-    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 4, 96000),
-             &caps.StreamAlts[1]);
-    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 4, 192000), NULL);
     CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 4, 44100),
-             &caps.StreamAlts[1]);
-    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 2, 96000),
-             &caps.StreamAlts[0]);
+             &caps.StreamAlts[10]);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 4, 96000),
+             &caps.StreamAlts[15]);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 4, 176400), NULL);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 4, 192000), NULL);
     // Nothing in the descriptor is 1-channel or 3-channel.
     CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 1, 48000), NULL);
     CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 8, 48000), NULL);
 
-    // Capture tops out at 48 kHz.
-    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_CAPTURE, 2, 48000),
-             &caps.StreamAlts[2]);
-    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_CAPTURE, 2, 88200), NULL);
-    // A rate cannot be looked up in the wrong direction.
-    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_RENDER, 2, 44100),
-             &caps.StreamAlts[0]);
+    // Capture mirrors the render table (16 alts, two bandwidth settings per
+    // rate) and reaches 192 kHz as 2ch — the M5 claim "capture tops out lower"
+    // is a fixture myth the real descriptor kills.
     CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_CAPTURE, 2, 44100),
-             &caps.StreamAlts[2]);
+             &caps.StreamAlts[16]);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_CAPTURE, 2, 48000),
+             &caps.StreamAlts[18]);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_CAPTURE, 2, 192000),
+             &caps.StreamAlts[25]);
+    CHECK_EQ(EmuCapsFindAlt(&caps, EMU_STREAM_CAPTURE, 4, 192000), NULL);
 
-    // Device-wide: 192000 is reachable through render 2ch even though no 4ch or
-    // capture alt has it, which is exactly why the claim is deliberately weak.
+    // Device-wide: 192000 is reachable through 2ch even though no 4ch alt has
+    // it, which is exactly why the claim is deliberately weak.
     CHECK(EmuCapsSupportsRate(&caps, 44100));
     CHECK(EmuCapsSupportsRate(&caps, 48000));
     CHECK(EmuCapsSupportsRate(&caps, 176400));

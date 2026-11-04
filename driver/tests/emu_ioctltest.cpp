@@ -1,4 +1,4 @@
-// EmuUSBAudio IOCTL-contract unit test, user-mode.
+﻿// EmuUSBAudio IOCTL-contract unit test, user-mode.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Build and run:  cd driver && ./utest.sh ioctl
@@ -171,21 +171,24 @@ static void CaseCapsFill0404(void)
     CHECK_EQ(info.ParsedFlags, caps.ParsedFlags);
     CHECK_EQ(info.ConfigurationValue, 1u);
     CHECK_EQ(info.AcInterfaceNumber, 0u);
-    CHECK_EQ(info.RenderAltCount, 2u);
-    CHECK_EQ(info.CaptureAltCount, 1u);
+    CHECK_EQ(info.RenderAltCount, 16u);
+    CHECK_EQ(info.CaptureAltCount, 16u);
     CHECK_EQ(info.MaxChannels, 4u);
     CHECK_EQ(info.MinRateHz, 44100u);
     CHECK_EQ(info.MaxRateHz, 192000u);
     CHECK_EQ(info.StatusEndpoint, 0x83u);
     CHECK_EQ(info.FeatureUnitCount, 1u);
-    CHECK_EQ(info.FeatureUnitId, 0x02u);
-    CHECK_EQ(info.FeatureMasterControls, 0x03u);
-    CHECK_EQ(info.ClockRateUnitId, 0x0Au);
-    CHECK_EQ(info.ClockSourceUnitId, 0x0Bu);
-    CHECK_EQ(info.DigitalIoUnitId, 0x0Cu);
-    CHECK_EQ(info.DeviceOptionsUnitId, 0x0Du);
-    CHECK_EQ(info.DirectMonitorUnitId, 0x0Eu);
-    CHECK_EQ(info.MeteringUnitId, 0x0Fu);
+    CHECK_EQ(info.FeatureUnitId, 0x04u);
+    CHECK_EQ(info.FeatureMasterControls, 0x01u);   // master is mute-only on this firmware
+    CHECK_EQ(info.ClockRateUnitId, 0x0Cu);
+    CHECK_EQ(info.ClockSourceUnitId, 0x0Du);
+    CHECK_EQ(info.DigitalIoUnitId, 0x0Eu);
+    CHECK_EQ(info.DeviceOptionsUnitId, 0x0Fu);
+    // The captured firmware carries only codes 0xE301..0xE304: the panel sees
+    // "no such unit" for direct monitor and metering instead of a unit id it
+    // cannot address.
+    CHECK_EQ(info.DirectMonitorUnitId, EMU_NO_VALUE);
+    CHECK_EQ(info.MeteringUnitId, EMU_NO_VALUE);
 
     // The reply's list is exactly what the parser's own query returns, in the
     // same order: one implementation, so the two cannot drift apart.
@@ -223,7 +226,7 @@ static void CaseCapsFillSparse(void)
     ConfigStart(b);
     Interface(b, 0, 0, 0, EMU_INTERFACE_CLASS_AUDIO, 0x01, 0x00);
     AcHeader(b);
-    OutputTerminal(b, 0x03, 0x0301, 2);
+    InputTerminal(b, 0x03, 0x0301, 2);
     Interface(b, 1, 1, 1, EMU_INTERFACE_CLASS_AUDIO, 0x02, 0x00);
     AsGeneral(b, 0x03, 1);
     FormatTypeIContinuous(b, 2, 3, 24, 8000, 192000);
