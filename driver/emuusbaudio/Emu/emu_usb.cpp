@@ -1,4 +1,4 @@
-// Contract-602 USB client for the EmuUSBAudio PortCls FDO (M2).
+﻿// Contract-602 USB client for the EmuUSBAudio PortCls FDO (M2).
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // WDM shape: USBD_CreateHandle on the PDO PortCls attached us to, URBs allocated
@@ -174,10 +174,15 @@ EmuUsbSendControl(
                   EMU_CTRL_SETUP_BYTES);
     // A short data stage is accepted at the USB level and checked here, so the
     // log shows how many bytes came back instead of only that the transfer died.
+    // USBD_DEFAULT_PIPE_TRANSFER is what routes the URB to endpoint zero when
+    // PipeHandle is NULL — without it the stack refuses the request with
+    // STATUS_INVALID_PARAMETER before the device ever sees it (hardware run
+    // 2026-11-04: the GET_CUR probe died with 0xC000000D on exactly this).
     urb->UrbControlTransfer.TransferFlags =
         (Request->Bytes[0] == EMU_CTRL_REQUEST_TYPE_OUT)
-            ? (ULONG)USBD_TRANSFER_DIRECTION_OUT
-            : (ULONG)(USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK);
+            ? (ULONG)(USBD_TRANSFER_DIRECTION_OUT | USBD_DEFAULT_PIPE_TRANSFER)
+            : (ULONG)(USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK |
+                      USBD_DEFAULT_PIPE_TRANSFER);
     urb->UrbControlTransfer.TransferBufferLength = Request->PayloadLength;
     urb->UrbControlTransfer.TransferBuffer = Payload;
     urb->UrbControlTransfer.TransferBufferMDL = NULL;
@@ -244,7 +249,10 @@ EmuUsbProbeClockRate(
         return;
     }
 
+    rate = 0;
     status = EmuUsbSendControl(Ctx, &request, &index);
+    EmuNoteProbeResult(Ctx, status, NT_SUCCESS(status)
+                                         ? EmuCtrlRateFromIndex(index) : 0);
     if (!NT_SUCCESS(status)) {
         EMU_LOG_TERSE(STR_MODULENAME "GET_CUR clock rate unit 0x%02X: 0x%x\n",
                       unitId, status);
@@ -265,6 +273,54 @@ EmuUsbProbeClockRate(
     }
     EMU_LOG_TERSE(STR_MODULENAME "GET_CUR clock rate unit 0x%02X: index %u = %lu Hz, cached\n",
                   unitId, (unsigned)index, rate);
+}
+
+// Mirror the clock-rate probe outcome into the service key's Parameters
+// values. The probe result decides whether the settings cache fills from reads
+// or only from SET_CUR, and on a machine without working kernel-debug capture
+// this registry breadcrumb is the only way to see the verdict. Write failures
+// are ignored - diagnostics must not break the path they diagnose.
+#pragma code_seg("PAGE")
+VOID
+EmuNoteProbeResult(
+    _In_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ NTSTATUS            Status,
+    _In_ ULONG               RateHz
+    )
+{
+    HANDLE            keyHandle = NULL;
+    OBJECT_ATTRIBUTES objectAttributes;
+    UNICODE_STRING    path;
+    UNICODE_STRING    valueName;
+    WCHAR             pathBuffer[512];
+    WCHAR             statusName[] = L"LastProbeStatus";
+    WCHAR             rateName[] = L"LastProbeRateHz";
+    PAGED_CODE();
+
+    if (EmuDriverRegistryPath.Buffer == NULL) {
+        return;
+    }
+    path.Buffer = pathBuffer;
+    path.Length = 0;
+    path.MaximumLength = (USHORT)sizeof(pathBuffer);
+    if (!NT_SUCCESS(RtlAppendUnicodeStringToString(&path,
+                     &EmuDriverRegistryPath)) ||
+        !NT_SUCCESS(RtlAppendUnicodeToString(&path, L"\\Parameters"))) {
+        return;
+    }
+    InitializeObjectAttributes(&objectAttributes,
+                               &path,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL,
+                               NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&keyHandle, KEY_SET_VALUE, &objectAttributes))) {
+        return;
+    }
+    RtlInitUnicodeString(&valueName, statusName);
+    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &Status, sizeof(Status));
+    RtlInitUnicodeString(&valueName, rateName);
+    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &RateHz, sizeof(RateHz));
+    ZwClose(keyHandle);
 }
 
 #pragma code_seg("PAGE")

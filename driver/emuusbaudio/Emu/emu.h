@@ -55,6 +55,10 @@ extern "C" {
 
 extern ULONG EmuTraceLevel;
 
+// The service key path, copied out of DriverEntry; the diagnostics breadcrumb
+// writes into its Parameters subkey when kernel debug capture is unavailable.
+extern UNICODE_STRING EmuDriverRegistryPath;
+
 // PnP state of one device instance. Stored as a LONG and written with
 // InterlockedExchange so later stages (IOCTLs, stream threads) can read it
 // without taking a lock.
@@ -194,6 +198,13 @@ EmuUsbRelease(
 // Submit one built class request on endpoint zero and wait for it. Payload is
 // the data stage: filled for a device-to-host request, sent for a
 // host-to-device one, NULL when there is none.
+VOID
+EmuNoteProbeResult(
+    _In_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ NTSTATUS            Status,
+    _In_ ULONG               RateHz
+    );
+
 NTSTATUS
 EmuUsbSendControl(
     _In_ PEMU_DEVICE_CONTEXT Context,

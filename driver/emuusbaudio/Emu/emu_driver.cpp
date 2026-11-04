@@ -19,6 +19,11 @@ static PDRIVER_UNLOAD g_PortClsUnload = NULL;
 // The stage-4c control device: driver-global, created in DriverEntry, deleted
 // in DriverUnload. The panel opens it as \\.\\EmuUSBAudioCtl.
 static PDEVICE_OBJECT g_ControlDevice = NULL;
+// The service key path, copied out of DriverEntry: the PnP manager's buffer is
+// only guaranteed while DriverEntry runs, and the diagnostics breadcrumb
+// writes into the Parameters subkey long after that.
+static WCHAR g_RegistryPathBuffer[512];
+UNICODE_STRING EmuDriverRegistryPath;
 
 #pragma code_seg("PAGE")
 static VOID EmuReadTraceLevel(_In_opt_ PUNICODE_STRING RegistryPath)
@@ -124,6 +129,19 @@ extern "C" NTSTATUS DriverEntry(
 {
     NTSTATUS status;
 
+    // The service key path is needed later by the probe breadcrumb; the
+    // PnP manager's buffer is only guaranteed while DriverEntry runs.
+    if (RegistryPath != NULL && RegistryPath->Buffer != NULL &&
+        RegistryPath->Length / sizeof(WCHAR) <
+        (sizeof(g_RegistryPathBuffer) / sizeof(WCHAR)) - 8) {
+        RtlCopyMemory(g_RegistryPathBuffer, RegistryPath->Buffer,
+                      RegistryPath->Length);
+        g_RegistryPathBuffer[RegistryPath->Length / sizeof(WCHAR)] = 0;
+        EmuDriverRegistryPath.Length = RegistryPath->Length;
+        EmuDriverRegistryPath.MaximumLength =
+            (USHORT)sizeof(g_RegistryPathBuffer);
+        EmuDriverRegistryPath.Buffer = g_RegistryPathBuffer;
+    }
     EmuReadTraceLevel(RegistryPath);
 
     status = PcInitializeAdapterDriver(DriverObject,

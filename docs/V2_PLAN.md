@@ -793,17 +793,21 @@ FORMAT_TYPE_III — теперь помечаются `NonPcm` и пропуск
 `utest.sh` — 4 из 4, 576 проверок. Утверждение RE_NOTES про скрытый class
 байт (0xFF + стандартный subclass) подтвердилось точно.
 
-**GET_CUR clock-rate пробник: 0xC000000D (STATUS_INVALID_PARAMETER)** —
-корень найден 2026-11-05 по документации и исходникам WDF:
-`URB_FUNCTION_CONTROL_TRANSFER` требует в `PipeHandle` handle **default
-control pipe**, который появляется только после select-configuration
-(WDF-исходник `fxusbdevicekm.cpp` открывает default pipe именно для этого
-поля). SelectConfiguration — отложенный шаг M2, поэтому URB отвергается
-USB-стеком до устройства; кэш состояния остаётся SET-only до него.
-GET_DESCRIPTOR работал без handle, потому что descriptor-URB USBD
-обрабатывает внутренне. Следствие: любой class-запрос EP0 (GET и SET)
-требует этапа SelectConfiguration — это не «отложенное улучшение», а
-обязательное условие всего control-plane.
+**GET_CUR clock-rate пробник — вердикт получен 2026-11-05.** Первая
+диагностика (0xC000000D = STATUS_INVALID_PARAMETER) была отказом USB-стека
+ДО устройства: `_URB_CONTROL_TRANSFER` с `PipeHandle = NULL` требует флага
+`USBD_DEFAULT_PIPE_TRANSFER` в TransferFlags (бит входит в
+`VALID_TRANSFER_FLAGS_MASK`; SelectConfiguration для этого НЕ нужен —
+именно он нужен для стриминга/альт, M3). После добавления флага (2.0.0.8)
+пробник на железе отвечает `0xC0000001` (STATUS_UNSUCCESSFUL — URB ушёл на
+устройство, отказ на/от шины) — согласуется с записью v1: firmware
+CA0189 не отвечает на GET_CUR (stall). **Кэш состояния наполняется
+только SET_CUR** — развилка этапов 2/3 закрыта окончательно. Вердикт
+виден без kernel-трейса: драйвер зеркалирует исход пробника в
+`Parameters\LastProbeStatus`/`LastProbeRateHz` (breadcrumb-канал,
+пригодившийся ещё и потому, что DebugView 5.02 из winget не работает
+как kernel-капчер на этой машине, а Driver Verifier — см. ниже —
+блокирует kernel-записи в реестр из DriverEntry).
 
 **Новый блокер: `CreateFile` на interface symbolic link даёт
 ERROR_FILE_NOT_FOUND** при включённом интерфейсе и работающем драйвере. Это
@@ -889,10 +893,24 @@ pool tracking, deadlock detection, DMA, DDI compliance), перезагрузк�
 `pnputil /enum-interfaces` показывал «Включено» с самого первого пуска,
 настоящий отказ происходил в KS на CREATE (см. этап 4c).
 
-Дальше: **SelectConfiguration** (`USBD_SelectConfigUrbAllocateAndBuild`,
-USBD_INTERFACE_LIST_ENTRY по всем интерфейсам) — обязательное условие
-любого class-запроса EP0, проверяемое на железе тем же GET_CUR-пробником;
-после него — SET_CUR по трейсу и ksoak под Verifier снова.
+**Два системных факта прогона, найденных breadcrumb-инструментацией:**
+
+1. **Driver Verifier блокирует kernel-записи в реестр из DriverEntry.**
+   Breadcrumb-значения (`EntryBread` из DriverEntry, `EmuCtlBread` через
+   ZwCreateKey) появились ТОЛЬКО после `verifier /reset` + перезагрузка; в
+   2.0.0.6 они писались до включения Verifier. Пока Verifier включён,
+   breadcrumb-канал диагностики не работает — все «пропажи» значений за
+   вечер объясняются этим, а не багами драйвера.
+2. **pnputil /add-driver /install не перевязывает devnode на новую версию
+   того же INF.** Инсталлы 2.0.0.10-2.0.0.14 не исполнялись вообще —
+   устройство оставалось на предыдущем импорте. kinstall.ps1 теперь снимает
+   все импорты `openemu-ks.inf` перед установкой (заодно исправлен поиск
+   devnode: паттерн без `*` не совпадал с InstanceId с серийным суффиксом).
+   Диагностика версий: DEVPKEY_Device_DriverVersion, а не вывод enum-drivers.
+
+Дальше: SET_CUR по трейсу (флаг USBD_DEFAULT_PIPE_TRANSFER уже разблоки-
+ровал EP0-class-запросы — SelectConfiguration остаётся для стриминга/альт,
+M3) и ksoak под Verifier снова.
 Примечание к пробам 4b: root-причина «интерфейс не включается» была
 ложной — pnputil показывал «Включено» с самого начала, настоящий отказ
 происходил в KS на CREATE.

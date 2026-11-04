@@ -76,21 +76,35 @@ function Find-ShBash {
 
 # pnputil /enum-drivers is localized, so match the INF name as a whole token on
 # its own line. 'openemu.inf' must not match the 'openemu-compat.inf' block.
-function Get-OemPackage([string]$infName) {
+# Hardware-run lesson: imports of the same INF name accumulate (one per
+# DriverVer bump), and a devnode bound to the older import does NOT migrate to
+# the newer one on /add-driver /install - the old binding has to be removed
+# first, which is why Remove-OemPackage takes every match and why the install
+# flow below removes 'openemu-ks.inf' before adding the fresh package.
+function Get-OemPackages([string]$infName) {
     $out = pnputil /enum-drivers | Out-String
+    $found = @()
     foreach ($block in ($out -split "`r?`n`r?`n")) {
         $hit = ($block -split "`r?`n") |
                Where-Object { $_ -match ('(^|\s)' + [regex]::Escape($infName) + '(\s|$)') }
-        if ($hit -and $block -match '(oem\d+\.inf)') { return $Matches[1] }
+        if ($hit -and $block -match '(oem\d+\.inf)') { $found += $Matches[1] }
     }
+    return $found
+}
+
+function Get-OemPackage([string]$infName) {
+    $all = Get-OemPackages $infName
+    if ($all.Count -gt 0) { return $all[0] }
     return $null
 }
 
 function Remove-OemPackage([string]$infName) {
-    $oem = Get-OemPackage $infName
-    if ($oem) {
-        Write-Host "removing $infName ($oem)"
-        pnputil /delete-driver $oem /uninstall /force | Out-Null
+    $all = Get-OemPackages $infName
+    if ($all.Count -gt 0) {
+        foreach ($oem in $all) {
+            Write-Host "removing $infName ($oem)"
+            pnputil /delete-driver $oem /uninstall /force | Out-Null
+        }
     } else {
         Write-Host "$infName not installed"
     }
@@ -192,6 +206,12 @@ Remove-OemPackage 'openemu-compat.inf'
 
 $dev = Get-EmuDevnode
 if (-not $dev) { Write-Warning "0404 not present: the package is installed but the device will bind on next plug-in." }
+
+# The devnode must let go of the previous kernel-driver import before the new
+# one can bind: /add-driver /install does not migrate an existing binding to a
+# newer DriverVer of the same INF, so without this every rebuild after the
+# first silently keeps running the old binary (hardware lesson 2026-11-05).
+Remove-OemPackage 'openemu-ks.inf'
 
 pnputil /add-driver $stagedInf /install
 
