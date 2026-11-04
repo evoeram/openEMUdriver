@@ -1,0 +1,78 @@
+; openEMUdriver v2 — kernel driver (PortCLS), M1 test-INF.
+;
+; Binds the whole E-MU 0404 USB device to EmuUSBAudio.sys, which is the only
+; PID this stage is approved for. Whole-device on purpose: the CA0189 firmware
+; declares every audio interface as vendor-class 0xFF, so there is no usable
+; usbccgp/MI_* split to bind against (see docs/RE_NOTES.md).
+;
+; M1 is a PnP skeleton: it registers no KS pins and creates no audio endpoints,
+; so WDMAUDIO.Registration is deliberately absent until M4 adds WaveRT filters.
+;
+; SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Media
+ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = openemu-ks.cat
+DriverVer   = 11/04/2026,2.0.0.1
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+emuusbaudio.sys = 1
+
+[Manufacturer]
+%MfgName% = EmuKs,NTamd64
+
+[EmuKs.NTamd64]
+%Emu0404.DeviceDesc% = Emu0404.Install, USB\VID_041E&PID_3F04
+
+;==============================================================
+; E-MU 0404 USB
+;==============================================================
+[Emu0404.Install]
+Include = ks.inf
+Needs   = KS.Registration
+CopyFiles = EmuKs.CopyList
+AddReg    = EmuKs.AddReg
+
+[Emu0404.Install.HW]
+AddReg = EmuKs.HwAddReg
+
+[Emu0404.Install.Services]
+AddService = EmuUSBAudio,0x00000002,EmuKs.Service
+
+[EmuKs.CopyList]
+emuusbaudio.sys
+
+[DestinationDirs]
+DefaultDestDir  = 12
+EmuKs.CopyList  = 12
+
+[EmuKs.Service]
+DisplayName   = %EmuKs.SvcDesc%
+ServiceType   = 1                  ; SERVICE_KERNEL_DRIVER
+StartType     = 3                  ; SERVICE_DEMAND_START
+ErrorControl  = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\emuusbaudio.sys
+
+[EmuKs.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,emuusbaudio.sys
+
+[EmuKs.HwAddReg]
+; FILE_DEVICE_SOUND
+HKR,,DeviceType,0x10001,0x0000001D
+; SDDL_DEVOBJ_SYS_ALL_ADM_ALL
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)"
+
+[Strings]
+ProviderName    = "openEMUdriver project"
+MfgName         = "openEMUdriver project"
+DiskName        = "EmuUSBAudio Installation Disk"
+Emu0404.DeviceDesc = "E-MU 0404 USB (openEMUdriver kernel, M1 skeleton)"
+EmuKs.SvcDesc   = "EmuUSBAudio - openEMUdriver kernel transport (M1)"

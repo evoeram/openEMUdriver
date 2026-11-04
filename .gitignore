@@ -10,3 +10,6 @@ build/
 
 # on-demand reference trees (tools/get-ref.sh)
 ref/
+
+# staged kernel driver package (kinstall.ps1 output)
+driver/package-ks/

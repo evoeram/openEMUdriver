@@ -125,7 +125,7 @@ fi
 w() { cygpath -w "$1"; }
 
 # Proven include order: km/crt must precede ucrt, otherwise _CRTIMP_ALT explodes.
-export INCLUDE="$(w "$INC_ROOT/$SDKVER/km/crt");$(w "$INC_ROOT/$SDKVER/ucrt");$(w "$INC_ROOT/$SDKVER/um");$(w "$INC_ROOT/$SDKVER/shared");$(w "$MSVC/include");$(w "$INC_ROOT/$SDKVER/km");$(w "$INC_ROOT/$SDKVER/shared");$(w "$DRV/Inc");$(w "$DRV/Main");$(w "$DRV/Filters");$(w "$DRV/Utilities");$(w "$WDF_INC");$(w "${WDF_INC%/*}/umdf")"
+export INCLUDE="$(w "$INC_ROOT/$SDKVER/km/crt");$(w "$INC_ROOT/$SDKVER/ucrt");$(w "$INC_ROOT/$SDKVER/um");$(w "$INC_ROOT/$SDKVER/shared");$(w "$MSVC/include");$(w "$INC_ROOT/$SDKVER/km");$(w "$INC_ROOT/$SDKVER/shared");$(w "$DRV/Inc");$(w "$DRV/Emu");$(w "$DRV/Main");$(w "$DRV/Filters");$(w "$DRV/Utilities");$(w "$WDF_INC");$(w "${WDF_INC%/*}/umdf")"
 export LIB="$(w "$MSVC/lib/x64");$(w "$WDK_LIB/$SDKVER/km/x64");$(w "$SDK_LIB/$SDKVER/um/x64");$(w "$WDF_LIB")"
 export PATH="$MSVC/bin/Hostx64/x64:$PATH"
 export MSYS_NO_PATHCONV=1

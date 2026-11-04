@@ -196,7 +196,7 @@ replug, power resume или surprise removal оно становится *unknow
 | Этап | Содержание | Критерий готовности |
 | --- | --- | --- |
 | M0. База и воспроизводимость | ✅ сделано 2026-11-04 (см. «Итог M0»): v1 tag'ом; убрать локальные пути из сборки (поиск тулчейна вместо MSBuild-проекта — `.vcxproj` из сэмпла ещё не подключены); отдельный signing-скрипт; восстановить или удалить ссылки на `ref/`; сохранять descriptor dumps | Чистая машина собирает v1 и smoke/v2 по инструкции — **выполнено на новой машине без WDK** |
-| M1. PnP-каркас 0404 | `PcAddAdapterDevice`, device context, remove lock, test-INF только 0404, корректные start/stop/remove/surprise-remove. Без аудио | 50 циклов disable/enable и remove/replug под Driver Verifier без утечек и BSOD |
+| M1. PnP-каркас 0404 | 🟡 2026-11-04: каркас написан и упакован (см. «Итог M1») — `driver/emuusbaudio/Emu/{emu.h,emu_driver.cpp,emu_pnp.cpp}`, `inf/openemu-ks.inf`, `driver/kinstall.ps1`, `driver/ksoak.ps1`. `PcAddAdapterDevice`, device context, remove lock, start/stop/remove/surprise-remove. Без аудио | 50 циклов disable/enable и remove/replug под Driver Verifier без утечек и BSOD — **не выполнено**: на этой машине нет 0404 и нет админ-прав; прогон §9 `docs/BUILD.md` на тестовой машине |
 | M2. USB + управление | Выбор конфигурации, parser capabilities, EP0 SET_CUR, кэш состояния, версионные IOCTL, безопасная регистрация device interface | Панель отдельно меняет rate/clock/S/PDIF/soft limit; WinUSB одновременно не открывается |
 | M3. Kernel ISO без PortCLS | Временный test-only IOCTL для 48 kHz stereo render/capture: URB-кольцо, StartFrame, статистика ошибок | Синус на OUT и loopback capture работают независимо от PortCLS; тестовый интерфейс удалён из release |
 | M4. Минимальный WaveRT | Только 48 kHz, 2 канала, 24-in-32. Сначала render, затем capture. Реальные буферы вместо ToneGenerator, USB-позиция, notifications | WASAPI render и capture + wasapi-test проходят; generator/savedata/timing emulation удалены |
@@ -239,12 +239,14 @@ MinGW, ни WDK, ни `ref/`) — это и есть «чистая машина
 * Полное дерево сэмпла **компилируется** (14 объектов, 0 ошибок), но не
   линкуется: 9 неразрешённых символов — user-mode `/GS`-поддержка из
   `LIBCMT` (`gs_support`/`gs_report` тянут `__imp_QueryPerformanceCounter`,
-  `__imp_TerminateProcess` и т. п.). Решение — либо действительно выкинуть
-  сэмпловую обвязку (`hw.cpp`, `savedata.cpp`, `ToneGenerator.cpp`), как
-  требует план, либо явно разбираться с CRT (`/NODEFAULTLIB`,
-  `BufferOverflowK.lib`). `.vcxproj`/MSBuild из сэмпла не подключены:
-  пока `kbuild.sh` покрывает требование воспроизводимости, MSBuild-проект —
-  отдельная задача.
+  `__imp_TerminateProcess` и т. п.). M1 закрыл вопрос с другой стороны:
+  каркас собран отдельным деревом `driver/emuusbaudio/Emu/`, без
+  `hw.cpp`/`savedata.cpp`/`ToneGenerator.cpp` и без KMDF, и линкуется чисто.
+  Сэмпловые `Main/Utilities/Filters` остаются материалом для M4 — к тому
+  моменту из них надо вынести user-mode CRT-зависимость (или явно разобраться
+  с `/NODEFAULTLIB` + `BufferOverflowK.lib`). `.vcxproj`/MSBuild из сэмпла не
+  подключены: пока `kbuild.sh` покрывает требование воспроизводимости,
+  MSBuild-проект — отдельная задача.
 * CI и автотестов нет (M0 их и не обещал).
 
 Эмпирика по установкам: NuGet `Microsoft.Windows.SDK.CPP.x64` содержит только
@@ -252,6 +254,90 @@ MinGW, ни WDK, ни `ref/`) — это и есть «чистая машина
 NuGet `Microsoft.Windows.WDK.x64` (105 МБ) — это `km`-заголовки, `km`-либы и
 `wdf/kmdf` до 1.35. Символы `WdfFunctions_01035`/`WdfDriverGlobals` даёт
 `wdfdriverentry.lib`.
+
+## Итог M1 (2026-11-04)
+
+Каркас написан, собирается, упаковывается в валидный подписанный пакет.
+**Критерий этапа (50 циклов под Driver Verifier) не выполнен** — на этой машине
+нет 0404 и нет админ-права, а `bcdedit /set testsigning on` требует
+перезагрузки. Это единственный незакрытый пункт M1; порядок прогона —
+`docs/BUILD.md` §9.
+
+Сделано:
+
+* `driver/emuusbaudio/Emu/{emu.h,emu_driver.cpp,emu_pnp.cpp}` — отдельное
+  дерево вместо правки `Main/adapter.cpp`; `driver/kbuild.sh` добавил
+  `$DRV/Emu` в `INCLUDE`. Результат: `emuusbaudio.sys` 7168 Б,
+  `/imports` → только `ntoskrnl.exe` (14 функций) и `portcls.sys` (4):
+  `PcInitializeAdapterDriver`, `PcAddAdapterDevice`,
+  `PcGetPhysicalDeviceObject`, `PcDispatchIrp`. KMDF не импортируется вообще,
+  поэтому в INF нет `[Install.NT.Wdf]`/`KmdfService`, а открытая проблема M0
+  (user-mode `/GS` из `LIBCMT`) обходится: `hw.cpp`/`savedata.cpp`/
+  `ToneGenerator.cpp` в цель не входят.
+* Раскладка PortCls-расширения проверена на месте, а не «на веру»: our context
+  лежит за `PORT_CLASS_DEVICE_EXTENSION_SIZE` (512 Б на x64), `AddDevice`
+  просит `PORT_CLASS_DEVICE_EXTENSION_SIZE + sizeof(EMU_DEVICE_CONTEXT)`;
+  `StartDevice` принимает расширение только если `Signature` равен 0 (свежий,
+  `IoCreateDevice` обнуляет) либо нашему значению **и** `PcGetPhysicalDeviceObject`
+  совпадает с PDO-слотом PortCls. Иначе — `STATUS_DEVICE_CONFIGURATION_ERROR`:
+  неверное предположение о раскладке валит старт, а не ломает память под
+  Verifier'ом.
+* Жизненный цикл: `StartDevice` идемпотентен (disable/enable переиспользует тот
+  же FDO, remove lock инициализируется один раз, счётчики старт/стоп/remove
+  переживают цикл); на `IRP_MN_REMOVE_DEVICE` — `IoReleaseRemoveLockAndWait`
+  **до** `PcDispatchIrp`, затем сразу `return` (FDO и расширение умирают
+  внутри PortCls, после форвардинга трогать нельзя); `SURPRISE_REMOVAL` ничего
+  не освобождает — за ним всегда приходит REMOVE; `QUERY_STOP`/`CANCEL_STOP`/
+  `QUERY_REMOVE`/`CANCEL_REMOVE` соглашаются и отдаются PortCls.
+* Трассировка: `_DbgPrintF` в free-сборке — пустой макрос, а `DEBUGLVL_*`/
+  `TRACE_LEVEL_*` из `ksdebug.h` под `_NTDDK_` не объявлены → свой `EMU_TRACE`
+  через `DbgPrintEx(DPFLTR_IHVDRIVER_ID, …)` с уровнем из
+  `<RegistryPath>\Parameters\TraceLevel` (читается в `DriverEntry`, кламп
+  ERROR..BLAB). `DriverUnload` chain'ится к PortCls'овскому.
+* `inf/openemu-ks.inf` — только `USB\VID_041E&PID_3F04`, whole-device (CA0189
+  прячет UAC за vendor-class 0xFF, дробить на MI_* нечего), `Class=Media`,
+  `Include=ks.inf`/`Needs=KS.Registration`, `PnpLockdown=1`;
+  `WDMAUDIO.Registration` намеренно нет до M4. `Inf2Cat /os:10_X64` — 0 ошибок,
+  0 предупреждений.
+* `driver/kinstall.ps1` — стейджинг в `driver/package-ks/` (в `.gitignore`) →
+  подпись `.sys` → `Inf2Cat` → подпись `.cat` → снятие `openemu.inf`/
+  `openemu-compat.inf` (претендуют на тот же devnode) → `pnputil /add-driver
+  /install` → статус devnode/сервиса/событий; `-Uninstall` возвращает v1 WinUSB.
+  Прогнано на этой машине: всё до `pnputil` проходит без повышения прав, `.sys`
+  и `.cat` подписаны тестовым сертификатом `E01D3BA3B04D…`.
+* `driver/ksoak.ps1` — приёмочный харнесс: `-Cycles 50` disable/enable с
+  ожиданием `CM_PROB_DISABLED` (22) и `OK`, `-RemoveCycles 10`
+  `/remove-device` + `/scan-devices`, nonpaged pool до/после через
+  `Win32_PerfFormattedData_PerfOS_Memory` (WMI-имена не локализованы, в отличие
+  от счётчиков `Get-Counter`), детект медленных циклов (>3 с — признак
+  зависшего remove lock), поиск ошибок `emuusbaudio`/`portcls` в System.
+  `-Verifier`/`-VerifierOff` только печатают команды: ни `verifier`, ни
+  `bcdedit`, ни перезагрузку скрипт не трогает.
+
+Подводные камни, найденные на этапе (не менять без причины):
+
+* `IoDeleteRemoveLock` в заголовках 10.0.26100 **нет**; в free-сборке у
+  `IO_REMOVE_LOCK` нет отладочного блока, поэтому явного удаления и не требуется.
+* `extern "C" PCPFNSTARTDEVICE EmuStartDevice;` объявляет **переменную**
+  типового указателя на функцию, а не функцию — только явный прототип.
+* `Inf2Cat` из 10.0.26100: `/verbose` → «Parameter format not correct», токенов
+  `11_*` нет (Windows 11 покрывается `10_X64`).
+* `pnputil /enum-drivers` локализован → разбор по имени INF как целому токену
+  (наследие `inf/oed-mode.ps1`, воспроизведено в `kinstall.ps1`).
+* `DriverEntry` обязан быть в `#pragma code_seg("INIT")` (образец так и делает);
+  после этого `dumpbin /headers` даёт `CA000040` → Initialized Data,
+  **Discardable**, а `PAGE` — `60000020` Code | Execute Read без бита
+  `Not Paged`, т. е. действительно страниц. Проверять после каждой смены
+  `code_seg`, а не на глаз.
+
+Что проверим первым на живой машине: что layout-гвард не срабатывает (иначе
+devnode в problem'е и `STATUS_DEVICE_CONFIGURATION_ERROR` в логе) и что PortCls
+довольен `MaxObjects=2` при нуле вызовов `PcRegisterSubdevice` — M1 не
+регистрирует KS-объектов совсем. Физические replug'ы обязательны отдельным
+прогоном: `/remove-device` + `/scan-devices` не воспроизводят surprise-remove
+посреди IO. Пока каркас занят ядром, v1 WinUSB к устройству не открывается —
+это ожидаемо и есть причина, по которой `kinstall.ps1` снимает v1-пакет, а
+`-Uninstall` его возвращает.
 
 ## Тесты (обязательные)
 

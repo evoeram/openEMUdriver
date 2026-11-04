@@ -64,17 +64,22 @@ export OED_KITS=/c/dev/tools/wdk
 (`Microsoft.VisualStudio.Component.Windows11SDK.26100`) — NuGet-пакет
 `Microsoft.Windows.SDK.CPP.x64` содержит только библиотеки.
 
-## 3. Сборка v2 (smoke)
+## 3. Сборка v2 (smoke и каркас M1)
 
 ```bash
 cd driver
 ./kbuild.sh emuusbaudio/build/smoke.sys emuusbaudio/smoke.c
+./kbuild.sh emuusbaudio/build/emuusbaudio.sys \
+     emuusbaudio/Emu/emu_driver.cpp emuusbaudio/Emu/emu_pnp.cpp
 ```
 
 Собирает что угодно из дерева драйвера (`Main/`, `Filters/`, `Utilities/`
 добавляются списком исходников). Порядок `INCLUDE` зафиксирован:
 `km\crt → ucrt → um → shared → MSVC\include → km → shared`; при другой
-последовательности заголовки разваливаются на `_CRTIMP_ALT`.
+последовательности заголовки разваливаются на `_CRTIMP_ALT`. Дерево `Emu/`
+(каркас M1) самодостаточно: `emu.h` виден из любого TU, линкуется без
+сэмпловой обвязки и без KMDF — `dumpbin /imports` даёт только `ntoskrnl.exe`
+и `portcls.sys`.
 
 Переопределения поиска (все необязательные):
 
@@ -156,3 +161,43 @@ kernel32-импорты). Это осознанно оставлено на M1: 
 сэмпловую обвязку (`hw.cpp`, `savedata.cpp`, `ToneGenerator.cpp`), и вместе с
 ней уйдёт зависимость от user-mode CRT. Подробности — раздел «Итог M0» в
 `docs/V2_PLAN.md`.
+
+Собственно M1 этого не трогает: каркас живёт в `driver/emuusbaudio/Emu/` и
+линкуется отдельно (см. §3). Сэмпловые `Main/Utilities/Filters` остаются в
+дереве как материал для M4; когда их подключат, `/GS`-обвязку к тому моменту
+выносят.
+
+## 9. Установка каркаса и приёмка M1 (нужны админ-права и 0404)
+
+`driver/kinstall.ps1` — полный путь от исходников до связанного devnode'а:
+сборка (опция `-Build`), стейджинг в `driver/package-ks/`, подпись бинаря,
+`Inf2Cat` (signability-проверка + `.cat`), подпись каталога, снятие
+конфликтующих пакетов v1/compat, `pnputil /add-driver /install` и статус
+devnode'а/сервиса/событий System:
+
+```powershell
+cd driver
+./kinstall.ps1 -Build          # установить каркас
+./kinstall.ps1 -Uninstall      # вернуть v1 WinUSB (openemu.inf)
+```
+
+Без админ-прав скрипт проходит стейджинг, Inf2Cat и подпись и падает ровно на
+`pnputil` (предупреждение заранее) — так пакет можно валидировать на любой
+машине.
+
+Приёмка этапа (50 disable/enable + remove/re-add под Driver Verifier) —
+`driver/ksoak.ps1`: снимает nonpaged pool до/после, ловит зависшие циклы,
+печатает ошибки по `emuusbaudio`/`portcls` из System:
+
+```powershell
+cd driver
+./kinstall.ps1 -Build
+verifier /standard /driver emuusbaudio.sys    # только на тестовой машине
+shutdown /r /t 0                               # Verifier вооружается после перезагрузки
+./ksoak.ps1 -Cycles 50 -RemoveCycles 10
+```
+
+`ksoak.ps1 -Verifier` только печатает эти команды и выходит — сам ни
+`verifier`, ни `bcdedit`, ни перезагрузку не трогает. Прямые physical
+replug'ы всё равно обязательны: `pnputil /remove-device` + `/scan-devices` не
+воспроизводят surprise-remove посреди IO.
