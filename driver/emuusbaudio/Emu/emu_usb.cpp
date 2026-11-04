@@ -367,10 +367,10 @@ EmuUsbExecuteSet(
 // are ignored - diagnostics must not break the path they diagnose.
 #pragma code_seg("PAGE")
 VOID
-EmuNoteProbeResult(
+EmuNoteStatusValue(
     _In_ PEMU_DEVICE_CONTEXT Ctx,
-    _In_ NTSTATUS            Status,
-    _In_ ULONG               RateHz
+    _In_ PCWSTR              Name,
+    _In_ ULONG               Value
     )
 {
     HANDLE            keyHandle = NULL;
@@ -378,9 +378,9 @@ EmuNoteProbeResult(
     UNICODE_STRING    path;
     UNICODE_STRING    valueName;
     WCHAR             pathBuffer[512];
-    WCHAR             statusName[] = L"LastProbeStatus";
-    WCHAR             rateName[] = L"LastProbeRateHz";
+
     PAGED_CODE();
+    UNREFERENCED_PARAMETER(Ctx);
 
     if (EmuDriverRegistryPath.Buffer == NULL) {
         return;
@@ -401,11 +401,21 @@ EmuNoteProbeResult(
     if (!NT_SUCCESS(ZwOpenKey(&keyHandle, KEY_SET_VALUE, &objectAttributes))) {
         return;
     }
-    RtlInitUnicodeString(&valueName, statusName);
-    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &Status, sizeof(Status));
-    RtlInitUnicodeString(&valueName, rateName);
-    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &RateHz, sizeof(RateHz));
+    RtlInitUnicodeString(&valueName, Name);
+    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &Value, sizeof(Value));
     ZwClose(keyHandle);
+}
+
+VOID
+EmuNoteProbeResult(
+    _In_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ NTSTATUS            Status,
+    _In_ ULONG               RateHz
+    )
+{
+    PAGED_CODE();
+    EmuNoteStatusValue(Ctx, L"LastProbeStatus", (ULONG)Status);
+    EmuNoteStatusValue(Ctx, L"LastProbeRateHz", RateHz);
 }
 
 #pragma code_seg("PAGE")
@@ -596,6 +606,14 @@ EmuUsbInitialize(
     EmuUsbLogCaps(Ctx->Caps);
     EmuUsbProbeClockRate(Ctx);
 
+    // M3 stage A: configure the configuration. Without it there is no
+    // configuration handle and no pipe handles, which M3's streaming needs.
+    status = EmuUsbSelectConfiguration(Ctx);
+    if (!NT_SUCCESS(status)) {
+        goto Exit;
+    }
+    EmuUsbProbeAltSelection(Ctx);
+
 Exit:
     if (header != NULL) {
         ExFreePoolWithTag(header, EMU_POOLTAG);
@@ -604,6 +622,179 @@ Exit:
         EmuUsbRelease(Ctx);
     }
     return status;
+}
+
+// Configure the configuration: one interface list entry per audio interface,
+// all at alternate setting 0 (idle). The entries point into our own
+// configuration descriptor copy, which stays alive for the whole start; the
+// interface information USBD fills in lives inside the select-config URB,
+// which stays alive too. This answers the plan's long-standing question about
+// USBD_INTERFACE_LIST_ENTRY semantics on hardware.
+#pragma code_seg("PAGE")
+NTSTATUS
+EmuUsbSelectConfiguration(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx
+    )
+{
+    PUSBD_INTERFACE_LIST_ENTRY list;
+    NTSTATUS status;
+
+    PAGED_CODE();
+    EmuNoteStatusValue(Ctx, L"SelConfigEnter", 1);
+
+    ULONG count = Ctx->Caps->AudioInterfaceCount;
+    list = (PUSBD_INTERFACE_LIST_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        (count + 1) * sizeof(USBD_INTERFACE_LIST_ENTRY),
+        EMU_POOLTAG);
+    if (list == NULL) {
+        EmuNoteStatusValue(Ctx, L"SelConfigStatus",
+                           (ULONG)STATUS_INSUFFICIENT_RESOURCES);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    for (ULONG i = 0; i < count; i++) {
+        LONG off = EmuCapsFindInterfaceDescriptor(
+            (const UCHAR*)Ctx->ConfigDescriptor, Ctx->ConfigDescriptorLength,
+            Ctx->Caps->AudioInterfaces[i].InterfaceNumber, 0);
+        if (off < 0) {
+            // The parser accepted an interface the block no longer carries:
+            // refuse rather than hand USBD a pointer into nowhere.
+            ExFreePoolWithTag(list, EMU_POOLTAG);
+            EmuNoteStatusValue(Ctx, L"SelConfigStatus",
+                               (ULONG)STATUS_DEVICE_CONFIGURATION_ERROR);
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+        list[i].InterfaceDescriptor =
+            (PUSB_INTERFACE_DESCRIPTOR)&((PUCHAR)Ctx->ConfigDescriptor)[off];
+        list[i].Interface = NULL;
+    }
+    list[count].InterfaceDescriptor = NULL;
+    list[count].Interface = NULL;
+
+    status = USBD_SelectConfigUrbAllocateAndBuild(Ctx->UsbdHandle,
+                                                  Ctx->ConfigDescriptor,
+                                                  list,
+                                                  &Ctx->SelectConfigUrb);
+    ExFreePoolWithTag(list, EMU_POOLTAG);
+    if (!NT_SUCCESS(status)) {
+        EMU_LOG_ERROR(STR_MODULENAME "select configuration failed, 0x%x\n",
+                      status);
+        EmuNoteStatusValue(Ctx, L"SelConfigStatus", (ULONG)status);
+        return status;
+    }
+
+    // The configuration handle every select-interface URB needs lives in the
+    // response, together with the alt-0 interface information.
+    Ctx->ConfigHandle = Ctx->SelectConfigUrb->UrbSelectConfiguration.ConfigurationHandle;
+    EmuNoteStatusValue(Ctx, L"SelConfigStatus", (ULONG)status);
+    return status;
+}
+
+// Move one direction to a streaming alternate (alt 0 returns it to idle).
+// The select-interface URB is kept in the direction's slot - the interface
+// information, with the pipe handles phase B needs, lives inside it. A
+// re-selection frees the previous URB first, which is safe while nothing
+// streams from its pipes.
+#pragma code_seg("PAGE")
+NTSTATUS
+EmuUsbSelectInterface(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ ULONG                  Direction,
+    _In_ ULONG                  InterfaceNumber,
+    _In_ ULONG                  AltSetting
+    )
+{
+    USBD_INTERFACE_LIST_ENTRY entry;
+    PURB urb = NULL;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (Direction > 1) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    LONG off = EmuCapsFindInterfaceDescriptor(
+        (const UCHAR*)Ctx->ConfigDescriptor, Ctx->ConfigDescriptorLength,
+        InterfaceNumber, AltSetting);
+    if (off < 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    entry.InterfaceDescriptor =
+        (PUSB_INTERFACE_DESCRIPTOR)&((PUCHAR)Ctx->ConfigDescriptor)[off];
+    entry.Interface = NULL;
+
+    status = USBD_SelectInterfaceUrbAllocateAndBuild(Ctx->UsbdHandle,
+                                                     Ctx->ConfigHandle,
+                                                     &entry,
+                                                     &urb);
+    if (!NT_SUCCESS(status)) {
+        EMU_LOG_ERROR(STR_MODULENAME "select interface %lu alt %lu failed, "
+                      "0x%x\n", InterfaceNumber, AltSetting, status);
+        return status;
+    }
+
+    if (Ctx->Stream[Direction].SelectInterfaceUrb != NULL) {
+        USBD_UrbFree(Ctx->UsbdHandle, Ctx->Stream[Direction].SelectInterfaceUrb);
+    }
+    Ctx->Stream[Direction].SelectInterfaceUrb = urb;
+    Ctx->Stream[Direction].Interface = &urb->UrbSelectInterface.Interface;
+    Ctx->Stream[Direction].InterfaceNumber = InterfaceNumber;
+    Ctx->Stream[Direction].AltSetting = AltSetting;
+    return status;
+}
+
+// Diagnostic pass over the streaming alternates, run once per start: move
+// render and capture to their 48 kHz alternates, then back to idle. Each step
+// is breadrumbed, so a hardware run answers whether the interface-selection
+// semantics work before M3 hangs an iso ring on them. No data is transferred:
+// a selected OUT alternate with nothing sent is idle by definition, and an IN
+// alternate with no pending transfer schedules nothing.
+#pragma code_seg("PAGE")
+VOID
+EmuUsbProbeAltSelection(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx
+    )
+{
+    const EMU_STREAM_ALT* render;
+    const EMU_STREAM_ALT* capture;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    render = EmuCapsFindAlt(Ctx->Caps, EMU_STREAM_RENDER, 2, 48000);
+    capture = EmuCapsFindAlt(Ctx->Caps, EMU_STREAM_CAPTURE, 2, 48000);
+    if (render == NULL || capture == NULL) {
+        // The descriptor vetted rates per alt already; without a 48 kHz pair
+        // there is nothing for M3's first test to stream and nothing to probe.
+        EMU_LOG_WARN(STR_MODULENAME "no 2ch 48 kHz alt pair, selection not probed\n");
+        EmuNoteStatusValue(Ctx, L"SelConfigStatus", (ULONG)0);
+        return;
+    }
+
+    status = EmuUsbSelectInterface(Ctx, EMU_STREAM_RENDER,
+                                   render->InterfaceNumber, render->AltSetting);
+    EmuNoteStatusValue(Ctx, L"SelRenderStatus", (ULONG)status);
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+
+    status = EmuUsbSelectInterface(Ctx, EMU_STREAM_CAPTURE,
+                                   capture->InterfaceNumber, capture->AltSetting);
+    EmuNoteStatusValue(Ctx, L"SelCaptureStatus", (ULONG)status);
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+
+    // Back to idle: both directions at alternate setting 0. The idle status is
+    // the last breadcrumb a reader sees unless a later step overwrites it.
+    status = EmuUsbSelectInterface(Ctx, EMU_STREAM_RENDER,
+                                   render->InterfaceNumber, 0);
+    if (NT_SUCCESS(status)) {
+        status = EmuUsbSelectInterface(Ctx, EMU_STREAM_CAPTURE,
+                                       capture->InterfaceNumber, 0);
+    }
+    EmuNoteStatusValue(Ctx, L"SelIdleStatus", (ULONG)status);
 }
 
 VOID
@@ -615,6 +806,23 @@ EmuUsbRelease(
 
     // Every field is cleared as it goes, so a second call after a partial
     // initialize can never double-free.
+    for (ULONG dir = 0; dir < 2; dir++) {
+        if (Ctx->Stream[dir].SelectInterfaceUrb != NULL) {
+            // The select-interface URB owns the interface information of the
+            // currently selected alternate; with the device gone neither the
+            // URB nor the alternate matter.
+            USBD_UrbFree(Ctx->UsbdHandle, Ctx->Stream[dir].SelectInterfaceUrb);
+            Ctx->Stream[dir].SelectInterfaceUrb = NULL;
+        }
+        Ctx->Stream[dir].Interface = NULL;
+    }
+    if (Ctx->SelectConfigUrb != NULL) {
+        // The configuration handle and the alt-0 interface information live
+        // inside this allocation - it dies with the start, like them.
+        USBD_UrbFree(Ctx->UsbdHandle, Ctx->SelectConfigUrb);
+        Ctx->SelectConfigUrb = NULL;
+    }
+    Ctx->ConfigHandle = NULL;
     if (Ctx->UsbdHandle != NULL) {
         // The PDO still exists at this point: STOP and REMOVE both run before
         // the PnP manager deletes it, which is why the handle closes here and

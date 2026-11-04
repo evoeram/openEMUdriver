@@ -611,6 +611,54 @@ static void CaseOverflowLimits(void)
 }
 
 // ---------------------------------------------------------------------------
+// interface descriptor lookup (the USB selection requests need byte
+// offsets into the configuration block)
+// ---------------------------------------------------------------------------
+
+static void CaseInterfaceDescriptorLookup(void)
+{
+    g_case = "iface-desc-lookup";
+    static EMU_DEVICE_CAPS caps;
+    CHECK(Parse0404(&caps));
+
+    // Every interface of the live device is findable at its zero-bandwidth
+    // setting, and so are the streaming alternates M3 will select.
+    CHECK_GE((long)EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 0, 0), 0);
+    CHECK_GE((long)EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 1, 0), 0);
+    CHECK_GE((long)EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 2, 0), 0);
+    CHECK_GE((long)EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 3, 0), 0);
+    LONG r48 = EmuCapsFindInterfaceDescriptor(
+        Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 1, 3);
+    CHECK_GE(r48, 0);
+    // The found block really is the requested interface descriptor.
+    CHECK_EQ(Emu0404RealDescriptor[r48], 9);
+    CHECK_EQ(Emu0404RealDescriptor[r48 + 1], 0x04);
+    CHECK_EQ(Emu0404RealDescriptor[r48 + 2], 1);
+    CHECK_EQ(Emu0404RealDescriptor[r48 + 3], 3);
+    CHECK_GE((long)EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 2, 16), 0);
+    CHECK_GE((long)EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 1, 18), 0);
+
+    // Missing combinations read as -1, never as a wrong offset.
+    CHECK_EQ(EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 4, 0), -1);
+    CHECK_EQ(EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 1, 19), -1);
+    CHECK_EQ(EmuCapsFindInterfaceDescriptor(
+             Emu0404RealDescriptor, sizeof(Emu0404RealDescriptor), 0, 1), -1);
+
+    // A block that ends mid-walk cannot point anywhere.
+    UCHAR tail[10] = {9, 0x04, 1, 0, 1, 0xFF, 0x02, 0x00, 0x00, 5};
+    CHECK_GE((long)EmuCapsFindInterfaceDescriptor(tail, 9, 1, 0), 0);
+    CHECK_EQ(EmuCapsFindInterfaceDescriptor(tail, 1, 1, 0), -1);
+}
+
+// ---------------------------------------------------------------------------
 // rate and alternate-setting lookup
 // ---------------------------------------------------------------------------
 
@@ -859,6 +907,7 @@ main(void)
     CaseMalformed();
     CaseOverflowLimits();
     CaseAltLookup();
+    CaseInterfaceDescriptorLookup();
     CaseRateList();
     CaseApiGuards();
 

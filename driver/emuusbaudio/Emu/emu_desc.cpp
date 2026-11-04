@@ -855,6 +855,36 @@ Fail:
     return status;
 }
 
+LONG
+EmuCapsFindInterfaceDescriptor(
+    _In_reads_bytes_(Length) const UCHAR* Descriptor,
+    _In_ ULONG Length,
+    _In_ ULONG Number,
+    _In_ ULONG AltSetting
+    )
+{
+    ULONG off = 0;
+
+    // Linear walk with self-guarding bounds: every step reads bLength first,
+    // and a block may not reach past the buffer. The caller has usually run
+    // the full parser over this block already; the guards here are for this
+    // function to stay correct on its own.
+    while (off + 2 <= Length) {
+        ULONG len = Descriptor[off];
+        ULONG type = Descriptor[off + 1];
+        if (len < 2 || off + len > Length) {
+            return -1;
+        }
+        if (type == EMU_DT_INTERFACE && len >= 9 &&
+            Descriptor[off + 2] == Number &&
+            Descriptor[off + 3] == AltSetting) {
+            return (LONG)off;
+        }
+        off += len;
+    }
+    return -1;
+}
+
 ULONG
 EmuCapsXuUnitId(_In_ const EMU_DEVICE_CAPS* Caps, _In_ ULONG ExtensionCode)
 {

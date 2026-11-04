@@ -139,6 +139,22 @@ typedef struct _EMU_DEVICE_CONTEXT {
     // under StateLock next to the cache it describes, reset on release:
     // after the device is gone the operation belongs to a dead session.
     NTSTATUS                      LastOperationStatus;
+
+    // M3 stage A: the configured configuration. The select-config URB stays
+    // alive for the whole start because the interface information - and
+    // through it the pipe handles of whatever alternates get selected -
+    // lives inside that allocation. The per-direction streaming entries
+    // hold the select-interface URB of the currently selected alternate
+    // (alt 0 = idle) and grow into the iso ring in phase B. Index by
+    // EMU_STREAM_RENDER (0) / EMU_STREAM_CAPTURE (1).
+    PURB                          SelectConfigUrb;
+    USBD_CONFIGURATION_HANDLE     ConfigHandle;
+    struct {
+        PURB                      SelectInterfaceUrb;
+        PUSBD_INTERFACE_INFORMATION Interface;
+        ULONG                     InterfaceNumber;
+        ULONG                     AltSetting;
+    }                             Stream[2];
 } EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
 // Stage 4c: the panel talks to a driver-owned control device object, not to
@@ -211,6 +227,48 @@ EmuUsbRelease(
 // half-applied change. The descriptor gets a veto before anything reaches
 // the wire: a rate it does not carry, or a SET for a unit the device does
 // not have, is refused without a bus roundtrip.
+// Configuration and interface selection (M3 stage A). SelectConfiguration
+// runs once per start and parks the configuration handle plus the alt-0
+// interface information in the select-config URB; SelectInterface moves one
+// direction to a streaming alternate and back (alt 0 = idle), keeping that
+// direction's select-interface URB alive while the alternate is
+// selected. Both are PASSIVE_LEVEL and breadcrumb their outcomes into
+// Parameters (SelConfigStatus / SelRenderStatus / SelCaptureStatus /
+// SelIdleStatus) - the USBD_INTERFACE_LIST_ENTRY semantics were a plan
+// question until this run proves them on hardware.
+NTSTATUS
+EmuUsbSelectConfiguration(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx
+    );
+
+NTSTATUS
+EmuUsbSelectInterface(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ ULONG                  Direction,
+    _In_ ULONG                  InterfaceNumber,
+    _In_ ULONG                  AltSetting
+    );
+
+// The per-start diagnostic pass: render and capture move to their 48 kHz
+// alternates and back, every step mirrored into the registry breadcrumb.
+VOID
+EmuUsbProbeAltSelection(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx
+    );
+
+// One named DWORD into the service Parameters key - the diagnostic channel
+// of record on this machine (see EmuNoteProbeResult in emu_usb.cpp). Driver
+// Verifier, while enabled, blocks these writes from DriverEntry.
+VOID
+EmuNoteStatusValue(
+    _In_opt_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ PCWSTR              Name,
+    _In_ ULONG               Value
+    );
+
+// One named DWORD into the service Parameters key - the diagnostic channel
+// of record on this machine (see EmuNoteProbeResult).
+
 NTSTATUS
 EmuUsbExecuteSet(
     _Inout_ PEMU_DEVICE_CONTEXT Ctx,

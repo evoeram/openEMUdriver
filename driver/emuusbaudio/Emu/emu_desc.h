@@ -305,6 +305,20 @@ EmuCapsSupportsRate(
 // Only discrete lists are collected: a continuous range has no enumerable
 // membership, which is what EMU_RATES_CONTINUOUS is for. Returns the number of
 // entries written to Rates, which never exceeds MaxRates.
+// Byte offset of the 9-byte interface descriptor for (Number, AltSetting)
+// inside a configuration block, or -1. This is what the USB selection
+// requests need: USBD_INTERFACE_LIST_ENTRY entries point INTO the
+// configuration descriptor for every interface being configured. The block
+// is expected to have passed EmuParseUsbConfigDescriptor already, so the
+// walk here only guards its own bounds.
+LONG
+EmuCapsFindInterfaceDescriptor(
+    _In_reads_bytes_(Length) const UCHAR* Descriptor,
+    _In_ ULONG Length,
+    _In_ ULONG Number,
+    _In_ ULONG AltSetting
+    );
+
 ULONG
 EmuCapsRateList(
     _In_ const EMU_DEVICE_CAPS* Caps,

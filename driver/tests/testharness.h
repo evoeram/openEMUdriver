@@ -1,4 +1,4 @@
-// Shared harness for the EmuUSBAudio user-mode unit tests (driver/utest.sh).
+﻿// Shared harness for the EmuUSBAudio user-mode unit tests (driver/utest.sh).
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #ifndef _EMU_TEST_HARNESS_H_
 #define _EMU_TEST_HARNESS_H_
@@ -17,6 +17,18 @@ extern const char* g_case;
             g_failures++;                                                      \
             printf("  FAIL [%s] %s:%d: %s\n",                                  \
                    g_case, __FILE__, __LINE__, #cond);                         \
+        }                                                                      \
+    } while (FALSE)
+
+#define CHECK_GE(actual, bound)                                                \
+    do {                                                                       \
+        g_checks++;                                                            \
+        unsigned long long a_ = (unsigned long long)(actual);                  \
+        unsigned long long b_ = (unsigned long long)(bound);                   \
+        if (!(a_ >= b_)) {                                                     \
+            g_failures++;                                                      \
+            printf("  FAIL [%s] %s:%d: %s (= 0x%llX) < %s (= 0x%llX)\n",       \
+                   g_case, __FILE__, __LINE__, #actual, a_, #bound, b_);       \
         }                                                                      \
     } while (FALSE)
 

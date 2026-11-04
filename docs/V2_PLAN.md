@@ -850,6 +850,31 @@ SET_RATE 44101 и SET_SPDIF_FORMAT 3 — отказы descriptor/domain-veto д�
 загрузки; диагностировалось по ImplementedMask (0x03 у старого образа
 против 0x3F у нового).
 
+### M3-A (2026-11-05): SelectConfiguration успешен, select-interface
+отказан — первая половина гейта стриминга
+
+`EmuCapsFindInterfaceDescriptor` (двойной исходник, смещение 9-байтного
+interface-дескриптора в блоке) + `EmuUsbSelectConfiguration`
+(USBD_INTERFACE_LIST_ENTRY по всем четырём audio-интерфейсам на alt 0,
+USBD_SelectConfigUrbAllocateAndBuild; URB и configuration handle живут в
+контексте весь старт — interface info живёт внутри URB-аллокации).
+**Железный вердикт: SelConfigStatus = 0 — SelectConfiguration прошёл на
+живой 0404** (маркер EntryBread=0x15 подтвердил свежий образ).
+Диагностический alt-проход (render/capture → их 48 кГц альты и обратно в
+alt 0) остановился на первом шаге: SelRenderStatus = 0xC000000D. Кандидат
+с лучшей аргументацией — одиночный entry без {NULL,NULL}-терминатора в
+USBD_SelectInterfaceUrbAllocateAndBuild; правка — терминатор, проверка —
+после следующей перезагрузки (образ живёт до неё).
+
+Инфраструктурный закон цикла разработки, оформленный окончательно:
+**kernel-образ драйвера выгружается только загрузкой ОС** —
+restart-device, disable, remove и даже удаление импортов со службой
+меняют привязку и файл на диске, но исполняемый образ живёт до перезагрузки
+(диагностика: маркер DriverEntry EntryBread со значением на сборку
+против устаревших значений). kinstall.ps1 теперь выполняет
+remove-device → sc stop → удаление импортов → add-driver → scan-devices:
+привязка и диск обновляются, образ — после перезагрузки.
+
 **Новый блокер: `CreateFile` на interface symbolic link даёт
 ERROR_FILE_NOT_FOUND** при включённом интерфейсе и работающем драйвере. Это
 `IRP_MJ_CREATE` на адаптерном FDO, и его отвечает KS-диспетчер PortCls:

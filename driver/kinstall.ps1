@@ -207,15 +207,22 @@ Remove-OemPackage 'openemu-compat.inf'
 $dev = Get-EmuDevnode
 if (-not $dev) { Write-Warning "0404 not present: the package is installed but the device will bind on next plug-in." }
 
-# The devnode must let go of the previous kernel-driver import before the new
-# one can bind: /add-driver /install does not migrate an existing binding to a
-# newer DriverVer of the same INF, so without this every rebuild after the
-# first silently keeps running the old binary (hardware lesson 2026-11-05).
+# Two hardware lessons of 2026-11-05 combined into the reload sequence:
+# (1) /add-driver /install does not migrate an existing binding to a newer
+# DriverVer of the same INF, so the old imports have to go; (2) a kernel
+# driver image is NOT reloaded by restart-device, device disable or device
+# remove - the service has to unload (DriverUnload runs) for the next start
+# to map the fresh binary. Hence: remove the devnode, stop the service,
+# delete the old imports, add the fresh package, scan - the re-enumerated
+# devnode binds and loads the new image.
+if ($dev) { pnputil /remove-device $dev.InstanceId | Out-Null }
+sc.exe stop EmuUSBAudio | Out-Null
+Start-Sleep -Seconds 2
 Remove-OemPackage 'openemu-ks.inf'
 
 pnputil /add-driver $stagedInf /install
 
-if ($dev) { pnputil /restart-device $dev.InstanceId | Out-Null }
+pnputil /scan-devices | Out-Null
 Start-Sleep -Seconds 2
 Show-Result
 
