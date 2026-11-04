@@ -1,14 +1,26 @@
 // EmuUSBAudio — openEMUdriver v2 kernel driver.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
-// PortCLS adapter for the E-MU USB audio interfaces. This is the M1 stage: a
-// PnP skeleton only. No USB I/O, no KS filters, no audio paths — the whole
-// point of M1 is a PortCls FDO that survives start/stop/remove/surprise-removal
-// cycles under Driver Verifier without leaks or bugchecks.
+// PortCLS adapter for the E-MU USB audio interfaces. M1 was a PnP skeleton; M2
+// adds the contract-602 USB client (emu_usb.cpp), the descriptor parser
+// (emu_desc.cpp) it feeds, the settings cache (emu_state.cpp) that parser fills
+// and the panel contract (emu_ioctl.h) served by emu_disp.cpp. Still no KS
+// filters and no audio paths.
 #ifndef _EMU_USB_AUDIO_H_
 #define _EMU_USB_AUDIO_H_
 
 #include <portcls.h>
+#include <usb.h>
+// usbdex.lib exports plain C names, so a C++ translation unit has to take the
+// declarations with C linkage — otherwise the link looks for mangled USBD_*
+// symbols and finds none.
+extern "C" {
+#include <usbdlib.h>
+}
+#include "emu_desc.h"
+#include "emu_ctrl.h"
+#include "emu_state.h"
+#include "emu_ioctl.h"
 
 #define STR_MODULENAME "EmuUSBAudio: "
 
@@ -54,6 +66,17 @@ typedef enum _EMU_STATE {
     EmuStateRemoved
 } EMU_STATE;
 
+// The state travels to the panel as EMU_WIRE_STATE_* numbers, and the numbers
+// are only as honest as this mapping. The driver tracks EMU_STATE, the panel
+// reads EMU_WIRE_STATE_*; if either table is reordered, the handler that
+// reports (LONG)State as the wire value starts lying in a way no runtime test
+// can catch cheaply.
+C_ASSERT((ULONG)EmuStateNotStarted      == EMU_WIRE_STATE_NOT_STARTED);
+C_ASSERT((ULONG)EmuStateStarted         == EMU_WIRE_STATE_STARTED);
+C_ASSERT((ULONG)EmuStateStopped         == EMU_WIRE_STATE_STOPPED);
+C_ASSERT((ULONG)EmuStateSurpriseRemoved == EMU_WIRE_STATE_SURPRISE_REMOVED);
+C_ASSERT((ULONG)EmuStateRemoved         == EMU_WIRE_STATE_REMOVED);
+
 // Layout of the device extension PortCls creates for the FDO.
 // PORT_CLASS_DEVICE_EXTENSION_SIZE is the whole PortCls-owned region
 // (64 pointers); of its first 64 bytes the documented free slots are the four
@@ -83,6 +106,39 @@ typedef struct _EMU_DEVICE_CONTEXT {
     PDEVICE_OBJECT Fdo;
     PDEVICE_OBJECT Pdo;
     IO_REMOVE_LOCK RemoveLock;
+
+    // Guards Caps and Settings against the stop/start races the remove lock
+    // does not cover: a panel handle left open across a disable/enable cycle
+    // can still be reading caps while EmuUsbRelease frees them, and the remove
+    // lock does not stop a STOP — it only stops a REMOVE. Every writer (start's
+    // parse and probe, release) and every reader that fills an IOCTL reply
+    // holds this mutex; it lives at APC_LEVEL for microseconds at a time, and
+    // the PnP manager serializes START against STOP on top of it.
+    FAST_MUTEX     StateLock;
+
+    // M2 stage 4b: the private control interface the panel opens. Registered
+    // against the PDO once per instance (the registration is PnP registry
+    // state and survives stop/start), enabled only after a start that parsed
+    // the descriptor, and disabled on stop and before removal. The name buffer
+    // comes from IoRegisterDeviceInterface and is freed at REMOVE, before the
+    // extension dies inside PcDispatchIrp.
+    UNICODE_STRING ControlInterfaceName;
+    BOOLEAN        ControlInterfaceEnabled;
+
+    // M2 USB client state. The handle registers this driver with the USB stack
+    // under contract 602; the descriptor block and the parsed caps are pool
+    // allocations — EMU_DEVICE_CAPS is a few kilobytes and the PortCls
+    // extension is nonpaged. All three are released together by EmuUsbRelease,
+    // which is idempotent because stop/start can repeat without a remove.
+    USBD_HANDLE                   UsbdHandle;
+    PUSB_CONFIGURATION_DESCRIPTOR ConfigDescriptor;
+    ULONG                         ConfigDescriptorLength;
+    PEMU_DEVICE_CAPS              Caps;
+    // What the driver has actually seen about the four E-MU controls. Small
+    // enough to live in the extension, unlike Caps; EmuSettingsInit is the only
+    // writer of the "nothing is known" state, and EmuUsbRelease calls it because
+    // a released device leaves no evidence behind.
+    EMU_SETTINGS                  Settings;
 } EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
 #define EMU_CONTEXT(Fdo) \
@@ -95,11 +151,41 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 extern "C" DRIVER_ADD_DEVICE AddDevice;
 extern "C" DRIVER_DISPATCH   EmuPnpHandler;
 
+// emu_disp.cpp — explicit prototype, not a DRIVER_DISPATCH declaration, per the
+// M1 note about typedef-typed declarations: a function type typedef makes the
+// bare form work, a pointer typedef silently declares a variable instead.
+extern "C" NTSTATUS NTAPI EmuDeviceControlHandler(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP        Irp
+    );
+
 extern "C" NTSTATUS
 EmuStartDevice(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP           Irp,
     _In_ PRESOURCELIST  ResourceList
+    );
+
+// emu_usb.cpp — contract-602 USB client. All three are PASSIVE_LEVEL and paged;
+// EmuUsbRelease is idempotent.
+NTSTATUS
+EmuUsbInitialize(
+    _In_ PEMU_DEVICE_CONTEXT Context
+    );
+
+VOID
+EmuUsbRelease(
+    _Inout_ PEMU_DEVICE_CONTEXT Context
+    );
+
+// Submit one built class request on endpoint zero and wait for it. Payload is
+// the data stage: filled for a device-to-host request, sent for a
+// host-to-device one, NULL when there is none.
+NTSTATUS
+EmuUsbSendControl(
+    _In_ PEMU_DEVICE_CONTEXT Context,
+    _In_ const EMU_CTRL_REQUEST* Request,
+    _Inout_opt_ PUCHAR Payload
     );
 
 #endif // _EMU_USB_AUDIO_H_

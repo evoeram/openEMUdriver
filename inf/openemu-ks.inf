@@ -16,7 +16,7 @@ Class       = Media
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = openemu-ks.cat
-DriverVer   = 11/04/2026,2.0.0.1
+DriverVer   = 11/04/2026,2.0.0.2
 PnpLockdown = 1
 
 [SourceDisksNames]
@@ -43,6 +43,19 @@ AddReg    = EmuKs.AddReg
 [Emu0404.Install.HW]
 AddReg = EmuKs.HwAddReg
 
+; The private control interface the panel opens (M2 stage 4b). The driver does
+; the registration itself — IoRegisterDeviceInterface in StartDevice against the
+; PDO — and enables it only after a start that parsed the descriptor; this
+; section is the INF-side declaration of the same GUID, so the interface has an
+; owner in the package and not only in code.
+[Emu0404.Install.Interfaces]
+AddInterface = %EmuCtl.IfaceGuid%,, Emu0404.CtlIface
+
+[Emu0404.CtlIface]
+; No interface-specific registry data on purpose: the panel talks IOCTL through
+; the handle, and the two answer codes are declared in
+; driver/emuusbaudio/Emu/emu_ioctl.h (the same header the panel compiles).
+
 [Emu0404.Install.Services]
 AddService = EmuUSBAudio,0x00000002,EmuKs.Service
 
@@ -61,8 +74,11 @@ ErrorControl  = 1                  ; SERVICE_ERROR_NORMAL
 ServiceBinary = %12%\emuusbaudio.sys
 
 [EmuKs.AddReg]
-HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
 HKR,,Driver,,emuusbaudio.sys
+; No AssociatedFilters on purpose: wdmaud/swmidi/redbook attach to the FDO and
+; look for KS filters, and M1 registers none (no PcRegisterSubdevice), so their
+; presence would mix other drivers' failures into the PnP soak. They come back
+; in M4 together with WDMAUDIO.Registration.
 
 [EmuKs.HwAddReg]
 ; FILE_DEVICE_SOUND
@@ -74,5 +90,9 @@ HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)"
 ProviderName    = "openEMUdriver project"
 MfgName         = "openEMUdriver project"
 DiskName        = "EmuUSBAudio Installation Disk"
-Emu0404.DeviceDesc = "E-MU 0404 USB (openEMUdriver kernel, M1 skeleton)"
-EmuKs.SvcDesc   = "EmuUSBAudio - openEMUdriver kernel transport (M1)"
+Emu0404.DeviceDesc = "E-MU 0404 USB (openEMUdriver kernel)"
+EmuKs.SvcDesc   = "EmuUSBAudio - openEMUdriver kernel transport"
+; The private control interface; the same GUID lives in
+; driver/emuusbaudio/Emu/emu_ioctl.h, which the panel compiles too. Changing
+; one without the other breaks only the panel — but silently.
+EmuCtl.IfaceGuid = "{6DC68D18-D4C8-4DAC-A456-6CA921953BE8}"

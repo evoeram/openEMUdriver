@@ -140,7 +140,11 @@ if ($Build) {
     Push-Location $drvDir
     try {
         & $bash ./kbuild.sh emuusbaudio/build/emuusbaudio.sys `
-            emuusbaudio/Emu/emu_driver.cpp emuusbaudio/Emu/emu_pnp.cpp
+            emuusbaudio/Emu/emu_driver.cpp emuusbaudio/Emu/emu_pnp.cpp `
+            emuusbaudio/Emu/emu_disp.cpp `
+            emuusbaudio/Emu/emu_usb.cpp emuusbaudio/Emu/emu_desc.cpp `
+            emuusbaudio/Emu/emu_ctrl.cpp emuusbaudio/Emu/emu_state.cpp `
+            emuusbaudio/Emu/emu_ioctl.cpp
         if ($LASTEXITCODE -ne 0) { throw "kbuild.sh failed" }
     } finally { Pop-Location }
 }

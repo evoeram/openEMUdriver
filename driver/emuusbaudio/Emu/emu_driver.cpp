@@ -115,15 +115,18 @@ extern "C" NTSTATUS DriverEntry(
     }
 
     // Wrap PnP so stop/remove/surprise-removal can be paired with our own
-    // teardown; every other minor code still goes to PortCls.
+    // teardown, and device-control so the two private panel codes are answered
+    // here while everything else still reaches PortCls. Every other minor code
+    // and major function goes to PortCls untouched.
     DriverObject->MajorFunction[IRP_MJ_PNP] = EmuPnpHandler;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = EmuDeviceControlHandler;
 
     // DriverEntry runs before any device exists, so an unload routine is
     // allowed here. PortCls has installed its own; keep it reachable.
     g_PortClsUnload = DriverObject->DriverUnload;
     DriverObject->DriverUnload = DriverUnload;
 
-    EMU_LOG_TERSE(STR_MODULENAME "loaded, M1 PnP skeleton, trace %lu\n",
+    EMU_LOG_TERSE(STR_MODULENAME "loaded, M2 control plane, trace %lu\n",
                   EmuTraceLevel);
 
     return STATUS_SUCCESS;

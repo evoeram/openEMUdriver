@@ -178,16 +178,47 @@ x64, `SupportedMask` и `ValidMask`, `StateSequence`, `LastOperationStatus`,
 replug, power resume или surprise removal оно становится *unknown* до повторной
 инициализации. Все SET-операции сериализуются на `PASSIVE_LEVEL`.
 
+Описано конкретными числами 2026-11-04 в `driver/emuusbaudio/Emu/emu_ioctl.h`
+(двойной заголовок: его же включает панель) и проверяется без железа
+(`driver/utest.sh ioctl`):
+
+* interface `{6DC68D18-D4C8-4DAC-A456-6CA921953BE8}`;
+* `EMU_IOCTL_GET_CAPS` = `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED,
+  FILE_READ_ACCESS)`, `EMU_IOCTL_GET_STATE` = тот же `0x801`;
+* `EMU_CAPS_INFO` — 40 ULONG (160 Б), `EMU_STATE_INFO` — 13 ULONG (52 Б); только
+  ULONG, ни указателя, ни 64-битного скаляра, поэтому раскладка не зависит от
+  разрядности клиента; `Size`/`Version` первыми полями, `EMU_IOCTL_VERSION 1`;
+* два набора бит: `SupportedMask` (что могло бы обеспечить дескриптор — единица
+  XU на соответствующий SET) и `ImplementedMask` (что отвечает эта сборка).
+  Панель предлагает только пересечение;
+* `ValidMask` ответа state выводится из `EMU_NO_VALUE`-полей кэша, а
+  `StateSequence` — счётчик принятых заметок; `PnpState` — числа
+  `EMU_WIRE_STATE_*`, которым в драйвере сопоставлен `EMU_STATE`;
+* произвольных `unitId`/`controlSelector`/длин в контракте нет: unit id
+  возвращается драйвером в `EMU_CAPS_INFO` как факт описания, а не принимается
+  от клиента;
+* кодов записи в этом заголовке намеренно нет. Пока трейс с железа не показал,
+  что CA0189 принимает `SET_CUR`, новый код был бы обещанием, которое драйвер не
+  выполняет, а панель — кнопкой, бьющей в stall.
+
+`EmuIoctlClassify` — решение без IRP: чужой control code уходит обратно PortCls
+(запросы KS/wdmaud идут через тот же FDO другим типом устройства — `FILE_DEVICE_KS`
+0x2f против наших 0x22), «не готово» опережает проверки буфера, пустой input и
+output достаточного размера — иначе `STATUS_INVALID_PARAMETER` /
+`STATUS_BUFFER_TOO_SMALL`. Обработчик `IRP_MJ_DEVICE_CONTROL`,
+`IoRegisterDeviceInterface` и строки `.Interfaces` в INF — написаны
+(см. «этап 4b»; на живом устройстве контракт по-прежнему не проверялся).
+
 ## Что реально есть сейчас
 
 | Часть | Состояние |
 | --- | --- |
 | v1 ASIO/WinUSB | Зрелая часть: ASIO COM DLL, панель, диагностика, INF, packed-24 streaming, явное кадровое планирование. На 0404 (fw 8.04) заявлены 44.1/48/96/192 кГц, 2/4 канала |
 | v2 kernel | Каркас: SimpleAudioSample, smoke.c, ручной kbuild.sh, план. Последний коммит — WIP |
-| USB в kernel | Отсутствует: выбор конфигурации, URB-пул, EP0, interrupt EP, feedback, iso-движок |
+| USB в kernel | Начато: contract-602 клиент (`USBD_CreateHandle`), GET_DESCRIPTOR + парсер в `EMU_DEVICE_CAPS`, транспорт class-запросов EP0 с read-only пробником clock-rate, кэш четырёх панельных контролов (`Emu/emu_state.cpp`), обработчик приватных IOCTL (`Emu/emu_disp.cpp`) и control interface (`IoRegisterDeviceInterface`/enable/disable). Отсутствует: выбор конфигурации и alt, `SET_CUR` на живом железе, URB-кольцо, interrupt EP, feedback, iso-движок |
 | PortCLS | Практически исходный сэмпл: stereo/16-bit/48 kHz, ToneGenerator, программный таймер, эмуляция DMA-позиции |
-| INF / ASIO / панель v2 | Не реализованы |
-| Воспроизводимость | M0 выполнен: `build.sh` и `driver/kbuild.sh` сами находят компилятор, WDK и SDK (локальные пути убраны), подпись вынесена в `driver/ksign.ps1`, `ref/` поднимается по запросу `tools/get-ref.sh`, дамп дескрипторов сохраняется `emu-dump -o`. Инструкция и фактические проверки — `docs/BUILD.md`. CI и автотестов по-прежнему нет |
+| INF / ASIO / панель v2 | Панель и ASIO не реализованы. Контракт панели описан и покрыт тестом (`Emu/emu_ioctl.{h,cpp}`, `driver/utest.sh ioctl`); обработчик `IRP_MJ_DEVICE_CONTROL`, `IoRegisterDeviceInterface` и строки `.Interfaces` в INF есть (этап 4b), но ни один IOCTL-запрос на живом устройстве ещё не ходил — первый вопрос этапа: принимает ли PortCls `IRP_MJ_CREATE` на адаптерном FDO |
+| Воспроизводимость | M0 выполнен: `build.sh` и `driver/kbuild.sh` сами находят компилятор, WDK и SDK (локальные пути убраны), подпись вынесена в `driver/ksign.ps1`, `ref/` поднимается по запросу `tools/get-ref.sh`, дамп дескрипторов сохраняется `emu-dump -o`. Юнит-тесты двойных исходников — `driver/utest.sh` (парсер, EP0-запросы, кэш, IOCTL-контракт). Инструкция и фактические проверки — `docs/BUILD.md`. CI по-прежнему нет |
 
 ## Этапы и критерии готовности
 
@@ -197,7 +228,7 @@ replug, power resume или surprise removal оно становится *unknow
 | --- | --- | --- |
 | M0. База и воспроизводимость | ✅ сделано 2026-11-04 (см. «Итог M0»): v1 tag'ом; убрать локальные пути из сборки (поиск тулчейна вместо MSBuild-проекта — `.vcxproj` из сэмпла ещё не подключены); отдельный signing-скрипт; восстановить или удалить ссылки на `ref/`; сохранять descriptor dumps | Чистая машина собирает v1 и smoke/v2 по инструкции — **выполнено на новой машине без WDK** |
 | M1. PnP-каркас 0404 | 🟡 2026-11-04: каркас написан и упакован (см. «Итог M1») — `driver/emuusbaudio/Emu/{emu.h,emu_driver.cpp,emu_pnp.cpp}`, `inf/openemu-ks.inf`, `driver/kinstall.ps1`, `driver/ksoak.ps1`. `PcAddAdapterDevice`, device context, remove lock, start/stop/remove/surprise-remove. Без аудио | 50 циклов disable/enable и remove/replug под Driver Verifier без утечек и BSOD — **не выполнено**: на этой машине нет 0404 и нет админ-прав; прогон §9 `docs/BUILD.md` на тестовой машине |
-| M2. USB + управление | Выбор конфигурации, parser capabilities, EP0 SET_CUR, кэш состояния, версионные IOCTL, безопасная регистрация device interface | Панель отдельно меняет rate/clock/S/PDIF/soft limit; WinUSB одновременно не открывается |
+| M2. USB + управление | Выбор конфигурации, parser capabilities, EP0 SET_CUR, кэш состояния, версионные IOCTL, безопасная регистрация device interface. **База проверена 2026-11-04**: USB-API доступено и линкуется (см. «Подготовка M2»); парсер дескрипторов + плановый тест №1 готовы (см. «Парсер дескрипторов и плановый тест №1»), сборка EP0-запросов и её тест — тоже (см. «Контрольные запросы EP0»), транспорт class-запросов и read-only пробник clock-rate встроены в `StartDevice` (см. «этап 2»; на нём же держится кэш состояния — `Emu/emu_desc.{h,cpp}` вопросы по частотам/alt, `Emu/emu_state.{h,cpp}` кэш и его тест, см. «этап 3»); набор операций и раскладка ответов описаны кодом и тестом («этап 4a»), обработчик `IRP_MJ_DEVICE_CONTROL` + `IoRegisterDeviceInterface` + `.Interfaces` в INF написаны («этап 4b»); реальной отправки `SET_CUR`, выбора конфигурации и проверки всего этого на железе ещё нет | Панель отдельно меняет rate/clock/S/PDIF/soft limit; WinUSB одновременно не открывается |
 | M3. Kernel ISO без PortCLS | Временный test-only IOCTL для 48 kHz stereo render/capture: URB-кольцо, StartFrame, статистика ошибок | Синус на OUT и loopback capture работают независимо от PortCLS; тестовый интерфейс удалён из release |
 | M4. Минимальный WaveRT | Только 48 kHz, 2 канала, 24-in-32. Сначала render, затем capture. Реальные буферы вместо ToneGenerator, USB-позиция, notifications | WASAPI render и capture + wasapi-test проходят; generator/savedata/timing emulation удалены |
 | M5. Форматы и full duplex | Все частоты 0404, затем 4 канала 44.1–96 кГц, feedback, external clock, обработка xruns | Все разрешённые сочетания работают; запрещённые (4ch/192k) корректно отклоняются |
@@ -239,14 +270,14 @@ MinGW, ни WDK, ни `ref/`) — это и есть «чистая машина
 * Полное дерево сэмпла **компилируется** (14 объектов, 0 ошибок), но не
   линкуется: 9 неразрешённых символов — user-mode `/GS`-поддержка из
   `LIBCMT` (`gs_support`/`gs_report` тянут `__imp_QueryPerformanceCounter`,
-  `__imp_TerminateProcess` и т. п.). M1 закрыл вопрос с другой стороны:
-  каркас собран отдельным деревом `driver/emuusbaudio/Emu/`, без
-  `hw.cpp`/`savedata.cpp`/`ToneGenerator.cpp` и без KMDF, и линкуется чисто.
-  Сэмпловые `Main/Utilities/Filters` остаются материалом для M4 — к тому
-  моменту из них надо вынести user-mode CRT-зависимость (или явно разобраться
-  с `/NODEFAULTLIB` + `BufferOverflowK.lib`). `.vcxproj`/MSBuild из сэмпла не
-  подключены: пока `kbuild.sh` покрывает требование воспроизводимости,
-  MSBuild-проект — отдельная задача.
+  `__imp_TerminateProcess` и т. п.). ЗАКРЫТО 2026-11-04 на M1: дело было не в
+  исходниках, а в линковочной линии — `-NODEFAULTLIB:LIBCMT.lib` +
+  `BufferOverflowK.lib` дают kernel-реализацию `__report_gsfailure`, и дерево
+  линкуется целиком (`sample.sys`, 91648 Б, импорты `ntoskrnl.exe`/`HAL.dll`/
+  `portcls.sys`). В цель каркаса `hw.cpp`/`savedata.cpp`/`ToneGenerator.cpp`
+  всё равно не входят — M1 по плану PnP-скелет без обвязки; теперь это выбор, а
+  не блокер. `.vcxproj`/MSBuild из сэмпла не подключены: пока `kbuild.sh`
+  покрывает требование воспроизводимости, MSBuild-проект — отдельная задача.
 * CI и автотестов нет (M0 их и не обещал).
 
 Эмпирика по установкам: NuGet `Microsoft.Windows.SDK.CPP.x64` содержит только
@@ -297,8 +328,11 @@ NuGet `Microsoft.Windows.WDK.x64` (105 МБ) — это `km`-заголовки,
 * `inf/openemu-ks.inf` — только `USB\VID_041E&PID_3F04`, whole-device (CA0189
   прячет UAC за vendor-class 0xFF, дробить на MI_* нечего), `Class=Media`,
   `Include=ks.inf`/`Needs=KS.Registration`, `PnpLockdown=1`;
-  `WDMAUDIO.Registration` намеренно нет до M4. `Inf2Cat /os:10_X64` — 0 ошибок,
-  0 предупреждений.
+  `WDMAUDIO.Registration` намеренно нет до M4. `AssociatedFilters`
+  (`wdmaud,swmidi,redbook`) из M1-INF тоже убрано: эти фильтры вешаются на FDO и
+  ищут KS-фильтры, которых каркас не регистрирует, — в соаке они подмешали бы
+  чужие отказы к нашим. Вернутся в M4 вместе с WaveRT/topology.
+  `Inf2Cat /os:10_X64` — 0 ошибок, 0 предупреждений.
 * `driver/kinstall.ps1` — стейджинг в `driver/package-ks/` (в `.gitignore`) →
   подпись `.sys` → `Inf2Cat` → подпись `.cat` → снятие `openemu.inf`/
   `openemu-compat.inf` (претендуют на тот же devnode) → `pnputil /add-driver
@@ -339,10 +373,421 @@ devnode в problem'е и `STATUS_DEVICE_CONFIGURATION_ERROR` в логе) и ч�
 это ожидаемо и есть причина, по которой `kinstall.ps1` снимает v1-пакет, а
 `-Uninstall` его возвращает.
 
+## Подготовка M2: USB-путь проверен (2026-11-04)
+
+M2 упирается в один вопрос — умеет ли наш харнес вообще говорить по USB из
+ядра. Проверено без железа (пробный TU, в репозиторий не кладётся: он ничего
+не устанавливает, `DriverEntry` возвращает `STATUS_DEVICE_NOT_READY`):
+
+* Две разные библиотеки, обе добавлены в `kbuild.sh`:
+  * `usbd.lib` — import-библиотека **USBD.SYS** (модуль реально лежит в
+    `System32\drivers`, 85 КБ) для легаси-хелперов:
+    `USBD_CreateConfigurationRequestEx`,
+    `USBD_ParseConfigurationDescriptorEx`,
+    `USBD_ValidateConfigurationDescriptor`, `USBD_QueryBusTime`. В образе
+    появляется импорт `USBD.SYS`.
+  * `usbdex.lib` — **статическая** реализация нового handle-API:
+    `USBD_CreateHandle(USBD_CLIENT_CONTRACT_VERSION_602)`,
+    `USBD_UrbAllocate`/`USBD_UrbFree`, `USBD_IsochUrbAllocate`,
+    `USBD_SelectConfigUrbAllocateAndBuild`,
+    `USBD_SelectInterfaceUrbAllocateAndBuild`,
+    `USBD_AssignUrbToIoStackLocation`, `USBD_CloseHandle`. Она сама находит
+    интерфейс `GUID_USBD_INTERFACE` через `IRP_MN_QUERY_INTERFACE`, поэтому
+    новых импортируемых модулей в образе нет — только `ntoskrnl.exe`
+    (`IoBuildDeviceIoControlRequest`, `IoAllocateIrp`, `KeWaitForSingleObject`,
+    `RtlQueryRegistryValues`, `MmIsDriverVerifying`, `KeBugCheckEx`).
+* Цена `usbdex.lib`: он собран с `/GS`, поэтому для линка обязательно
+  `-NODEFAULTLIB:LIBCMT.lib` + `BufferOverflowK.lib`; без них — та же стена M0
+  (user-mode `gs_report` с `__imp_TerminateProcess`). Тем самым закрыт и вопрос
+  «линкуется ли сэмпловое дерево» — линкуется (`sample.sys`, 91648 Б, импорты
+  `ntoskrnl.exe`/`HAL.dll`/`portcls.sys`).
+* Типы URB под M2/M3 подтверждены компиляцией:
+  `struct _URB_CONTROL_TRANSFER` (`PipeHandle = NULL` для EP0,
+  `SetupPacket[8]`, `TransferFlags = USBD_TRANSFER_DIRECTION_OUT`),
+  `struct _URB_ISOCH_TRANSFER` (`StartFrame`, `NumberOfPackets`, `ErrorCount`,
+  `IsoPacket[].Offset/Length/Status`; `USBD_START_PIPELINE_FILTER` в этом SDK
+  **нет** — для render просто `USBD_TRANSFER_DIRECTION_OUT`),
+  `struct _URB_SELECT_CONFIGURATION` (`ConfigurationDescriptor`,
+  `ConfigurationHandle`, встроенный `Interface`),
+  `USBD_INTERFACE_LIST_ENTRY`/`USBD_INTERFACE_INFORMATION`.
+* Что проверкой **не** является: выбор стековой локации для
+  `USBD_AssignUrbToIoStackLocation` (в пробе — `IoGetNextIrpStackLocation` для
+  IRP из `IoBuildDeviceIoControlRequest`) и реальная семантика
+  `USBD_INTERFACE_LIST_ENTRY` (терминатор `{NULL,NULL}`, `Interface.Length` под
+  число endpoint'ов). Закрыто 2026-11-04 по документации, а не по догадке:
+  «How to Submit an URB» требует `IoAllocateIrp(Target->StackSize, …)` +
+  `IoGetNextIrpStackLocation` в `IRP_MJ_INTERNAL_DEVICE_CONTROL` с
+  `IOCTL_INTERNAL_USB_SUBMIT_URB`, затем `USBD_AssignUrbToIoStackLocation` и
+  `IoSetCompletionRoutineEx` на том же target; `USBD_CreateHandle(FDO,
+  StackDeviceObject=PDO, 602, tag, &h)`. Семантика
+  `USBD_INTERFACE_LIST_ENTRY` для `SelectConfiguration` — остаётся первым
+  вопросом на живом устройстве.
+* `USBD_QueryBusTime` помечен `__drv_preferredFunction("Obsolete")`; для
+  `StartFrame` в M3 предпочтителен URB
+  `URB_FUNCTION_GET_CURRENT_FRAME_NUMBER` (`struct
+  _URB_GET_CURRENT_FRAME_NUMBER`) — сравнить оба на железе, а не верить
+  комментарии из заголовка.
+
+Форма M2 с этой базой: `StartDevice` → `USBD_CreateHandle(FDO, PDO)` →
+`GET_DESCRIPTOR(configuration)` через URB → чистый парсер дескрипторов
+(юнит-тест в user-mode по фикстуре — плановый тест №1) →
+`SelectConfiguration`/`SelectInterface` на vendor-class интерфейсы → кэш
+состояния + EP0 `SET_CUR` (протокол в `docs/PROTOCOL.md`) → версионные IOCTL и
+device interface.
+
+### Парсер дескрипторов и плановый тест №1 (2026-11-04)
+
+Из всей цепочки M2 реализован и проверен её центр — разбор configuration
+descriptor. `driver/emuusbaudio/Emu/emu_desc.h` + `.cpp`: вход — raw block из
+`GET_DESCRIPTOR`, выход — `EMU_DEVICE_CAPS` (роли интерфейсов, AC-статусный EP,
+терминалы, FEATURE_UNIT, EXTENSION_UNIT с `wExtensionCode`, по каждому alt:
+направление, каналы/подфрейм/битность, список частот либо continuous-диапазон,
+data-EP с `wMaxPacketSize`/attributes/usage, feedback-EP). Байты читаются
+смещениями без структурных кастов, поэтому один и тот же TU собирается и в
+образ (`-DEMU_KERNEL` → `<ntddk.h>`), и в user-mode (`<windows.h>` +
+`<ntstatus.h>`).
+
+Сознательные правила, которые тест проверяет поштучно:
+
+* `wTotalLength` обязан равняться длине переданного блока; короткий хвост,
+  `bLength < 2` и выход за блок — `STATUS_DATA_ERROR`, а не «разобрали что
+  успели».
+* alt 0 (zero-bandwidth) не записывается никогда; alt без `AS_GENERAL`, без
+  PCM-формата или без data-EP — `STATUS_DEVICE_CONFIGURATION_ERROR`, потому что
+  M3 иначе построил бы несуществующий пайплайн.
+* направление считается по `bTerminalLink` (`OUTPUT_TERMINAL` → render,
+  `INPUT_TERMINAL` → capture) и сверяется с битом направления data-EP;
+  расхождение — ошибка.
+* переполнение любого лимита (`*_MAX_*`) — `STATUS_BUFFER_OVERFLOW`, тихого
+  отбрасывания записей нет; ровно на границе парсер обязан проходить.
+* роли выводятся из `bInterfaceSubclass` (CA0189 прячет только класс,
+  `0xFF` + subclass 1/2 — тот же признак, на котором стоит v1); оба layout
+  `EXTENSION_UNIT` распознаются, фактический записан в `Caps`.
+* при неудаче `Caps` пересобирается в исходное пустое состояние: один
+  `EMU_DEVICE_CAPS` живёт между циклами start/stop и «почти правильный» вывод
+  хуже отсутствия вывода.
+
+Запуск: `cd driver && ./utest.sh desc` — сначала компиляция парсера флагами
+`kbuild.sh` (`-kernel -W3 -WX`, строка `KERNEL-COMPILE: … ok`), затем
+user-mode-тест `driver/tests/emu_desctest.cpp`. Фактический результат:
+`142 checks, 0 failures / RESULT: PASS`, обе kernel-цели после изменений
+собираются (`smoke.sys`, `emuusbaudio.sys`).
+
+Покрыто: malformed lengths, лишние/переставленные endpoint'ы, превышение
+размеров массивов, оба XU-layout, continuous-частоты, non-PCM alt. Не покрыто
+и требует железа: «реальные дескрипторы всех моделей» — фикстура 0404 собрана
+по замерам `docs/RE_NOTES.md`; как только `emu-dump -o docs/descriptors` даст
+raw hex, она заменяется дампом.
+
+### USB-клиент M2, этап 1: дескриптор с живого устройства (2026-11-04)
+
+`driver/emuusbaudio/Emu/emu_usb.cpp` — contract 602 поверх `usbdex.lib`:
+`USBD_CreateHandle(Fdo, Pdo, 602, EMU_POOLTAG)` в `StartDevice`, синхронная
+отправка URB (`IoAllocateIrp(Pdo->StackSize)` → `IoGetNextIrpStackLocation` →
+`IRP_MJ_INTERNAL_DEVICE_CONTROL` + `IOCTL_INTERNAL_USB_SUBMIT_URB` →
+`USBD_AssignUrbToIoStackLocation` → `IoSetCompletionRoutineEx` →
+`IoCallDriver(Pdo)` → `KeWaitForSingleObject`), два `GET_DESCRIPTOR`
+(configuration): сначала 9 байт, чтобы узнать `wTotalLength`, затем ровно
+столько же; расхождение `wTotalLength` между чтениями и короткий transfer —
+ошибка, не «частичный успех». `EMU_DEVICE_CAPS` (~2.5 КБ) — `ExAllocatePool2`
+в nonpaged, в расширении FDO только указатели. `StopDevice` и `RemoveDevice`
+вызывают `EmuUsbRelease` (идемпотентен: каждый ресурс обнуляется при
+освобождении), поэтому 50 циклов start/stop из M1-соака не текут.
+
+Что этот этап даёт помимо самой цепочки: разобранную таблицу (`config/iface/alt/XU`
+одной строкой на запись) драйвер печатает при `TraceLevel >= 4`, raw hex
+дескриптора по 16 байт на строку — при `>= 5`. Это и есть способ получить
+настоящие дескрипторы 0404 в `docs/descriptors` без WinUSB-панели, которую
+нельзя открывать, когда к устройству привязан ядерный драйвер.
+
+`SelectConfiguration`/`SelectInterface` сюда намеренно не входят: они меняют
+состояние шины, и их параметры (`USBD_INTERFACE_LIST_ENTRY`, `Interface.Length`
+под число endpoint'ов) надо сверять на трейсе живого устройства, а не писать
+дважды на глазок.
+
+Проверено: `emuusbaudio.sys` собирается и линкуется с пятью TU
+(`emu_driver.cpp emu_pnp.cpp emu_usb.cpp emu_desc.cpp emu_ctrl.cpp`),
+`dumpbin /imports` —
+только `ntoskrnl.exe` и `portcls.sys` (usbdex статический, `USBD.SYS` в
+импортах не появляется); `smoke.sys`, `sample.sys` и `./utest.sh` (2 из 2
+бинарника зелёные) после изменений тоже проходят.
+Проверено **не** является загрузкой на железе: M1-акцептанс (testsigning,
+Verifier, soak) до сих пор не выполнен, и именно он покажет, что тракт
+`USBD_CreateHandle → GET_DESCRIPTOR` проходит на 0404.
+
+### Контрольные запросы EP0: builders и тест (2026-11-04)
+
+`driver/emuusbaudio/Emu/emu_ctrl.h` + `.cpp` — второй исходник двойного
+назначения: сборка
+class-запросов CA0189 (`bmRequestType` 0x21/0xA1, `bRequest` CUR,
+`wValue = (CS<<8)|channel`, `wIndex = (unitID<<8)|AcInterface`, `wLength`) и
+кодеков значений: index частоты 0..5, 4-байтный big-endian rate цифрового входа,
+SInt16-громкость в 1/256 дБ. Отправки здесь нет — модуль не ссылается ни на USB,
+ни на ядро, и потому собирается и в образ, и в user-mode-тест одним и тем же
+исходником; транспорт — `EmuUsbSendControl` в `Emu/emu_usb.cpp` (см. этап 2).
+
+Одно правило, которое проверяется отдельно: отказ сборки обнуляет весь запрос.
+`bmRequestType == 0` не называет ни одного class-контроля, так что вызов,
+проигнорировавший статус, упрётся в stall нулевого EP0 вместо молчаливой смены
+частоты или лимитера. Для `EmuCtrlBuildClockRateSet(44000)` это принципиально:
+без обнуления остался бы готовый SET_CUR с index 0, то есть 44100.
+
+`driver/tests/emu_ctrltest.cpp` — 123 проверки, `RESULT: PASS`. Ассерт идёт по
+восьми байтам setup-пакета, а не по кодам возврата: поле, сдвинутое на байт,
+адресует другой контроль, и устройство отвечает на корректный неверный запрос
+сменой состояния. Ожидаемые байты — раскладка v1-движка (`src/emu_usb.cpp:311-360`),
+который на этом железе работает, а не спецификация «в среднем»: там же проверены
+границы (`unitID`/`channel` 0x100 отклоняются, 0xFF — нет; `wLength` 20 проходит,
+21 — нет), кодировка −127 дБ (`0x8100` → `00 81`) и знакового минимума,
+`GET_CUR` lock/rate/format и `SET_CUR` rate/source/soft limit/format.
+
+Тест заодно поймал две собственные ошибки ожидания (192000 в BE — это
+`00 02 EE 00`, а `80 80` — не −127 дБ) и одну настоящую в коде: путь
+«нет index для этой частоты» возвращал статус, оставляя собранный запрос
+отправляемым. Исправлено до зелёного прогона.
+
+Чего этап не доказывает: что железо принимает эти байты (для 0404 — только по
+трейсу M1-акцептана) и что `GET_CUR` вообще отвечает: v1 фиксирует stall на
+`0xA1` (docs/PROTOCOL.md), поэтому читалка состояния — тоже проверка на железе,
+не на фикстуре. Для этого она вынесена в отдельный необязательный пробник
+(см. этап 2), а не вшита в тракт открытия устройства.
+
+### USB-клиент M2, этап 2: транспорт class-запросов и пробник (2026-11-04)
+
+`EmuUsbSendControl` (`Emu/emu_usb.cpp`) — `struct _URB_CONTROL_TRANSFER` поверх
+уже доказанного `EmuUsbSubmitUrb`: `Hdr.Function = URB_FUNCTION_CONTROL_TRANSFER`,
+`PipeHandle = NULL` (нулевой адресат описывается самим setup-пакетом — интерфейс
+и юнит лежат в `wIndex`), setup из `EMU_CTRL_REQUEST`, направление по
+`bmRequestType` (`USBD_TRANSFER_DIRECTION_OUT` / `IN | SHORT_TRANSFER_OK`),
+`TransferBuffer` = буфер вызывающей стороны. Короткий data-stage разрешён на
+уровне USB, но здесь же сверяется длина: несовпала — `STATUS_DEVICE_CONFIGURATION_ERROR`,
+stall — `STATUS_DEVICE_HARDWARE_ERROR` с usb-статусом в логе. Это ровно та
+семантика, на которой парсер отказывается считать успехом частичный transfer.
+
+`EmuUsbProbeClockRate` — первый собственный запрос драйвера, и он ничего не
+меняет: `GET_CUR` clock-rate на том unit id, который назвал парсер. Неудача не
+приводит к отказу `StartDevice` (v1 говорит, что это железо не отвечает на
+`0xA1`), значение пишется одной TERSE-строкой вместе с index и Hz. Смысл именно
+в этой строке: за тот же прогон M1-акцептанса становится известно, читается ли
+состояние с нулевого EP0 из ядра. Это и есть развилка для кэша состояния: если
+отвечает — зеркало наполняется чтениями, как в v1; если нет — только из
+`SET_CUR`, и панель не может показать реальное значение, которое кто-то поменял
+снаружи.
+
+Проверено: image 30208 → 33280 Б, `dumpbin /imports` по-прежнему
+`ntoskrnl.exe` + `portcls.sys`; сборка идёт без warning'ов, `./utest.sh` —
+2 из 2, `smoke.sys` и `sample.sys` линкуются. Не проверено решительно ничего
+на железе: `SET_CUR` отсюда не отправляется (он меняет состояние устройства и
+ждёт того же трейса, что и `SelectConfiguration`), а data-stage длиннее одного
+байта этим путём ещё не ходил.
+
+### USB-клиент M2, этап 3: вопросы к таблице частот и кэш состояния (2026-11-04)
+
+Этап 2 оставил развилку («читается ли состояние с EP0»), но не место, где ответ
+хранится. Добавлены ещё два двойных исходника — оба и в образе, и под тестом.
+
+`Emu/emu_desc.cpp` пополнился вопросами к уже разобранной таблице:
+`EmuAltSupportsRate` (дискретный список должен назвать частоту ровно; непрерывный
+диапазон отвечает «да» на всё между минимумом и максимумом включительно),
+`EmuCapsFindAlt(Caps, Direction, Channels, RateHz)` и `EmuCapsSupportsRate`.
+`EmuCapsFindAlt` перебирает alt'ы в порядке дескрипторов и отдаёт первый
+подходящий: выбор детерминирован для конкретного устройства и не зависит от того,
+в каком порядке заполнилась таблица. Формат (SubFrameSize/BitResolution) он не
+учитывает — alt подбирает вызывающая сторона под тот, который она умеет
+заполнять. `EmuCapsSupportsRate` сформулирована сознательно слабо
+(«частота встречается где-нибудь»), потому что такт в CA0189 один на всё
+устройство, а какие потоки откроются в момент чтения состояния неизвестно;
+per-direction правда добывается только из `EmuCapsFindAlt`. Нулевая частота не
+проходит никогда: парсер отвергает 0 и в дискретном списке, и в границе
+диапазона, так что TRUE означает реальное значение из дескриптора. Именно это и
+не даёт битому байту из GET'а притвориться 44100 Гц.
+
+`Emu/emu_state.cpp` — четыре панельных контрола в одном `EMU_SETTINGS` (rate Hz,
+clock source, digital format, soft limit), где `EMU_NO_VALUE` значит «значение
+никогда не было установлено», а не «ноль». Маркер нужен ровно из-за железа:
+`GET_CUR` на CA0189 стоит (docs/PROTOCOL.md), поэтому поле может знать только то,
+что драйвер видел сам — удачное чтение или собственный `SET_CUR`. Обнулённая
+структура выглядела бы как «0 Гц, внутренний такт, soft limit выключен», и панель
+показала бы это как факт; `EmuSettingsInit` такой возможности не оставляет и
+вызывается и на старте, и в `EmuUsbRelease` — после release устройства никаких
+доказательств не остаётся.
+
+`EmuSettingsNoteRate` — всё правило кэша целиком: частоту, против которой
+говорит дескриптор, не записываем, и уже известное значение при отказе не
+трогаем. Отсюда и безопасность пробника: индекс вне таблицы декодируется в 0 Гц
+(`EmuCtrlRateFromIndex`), а отказ записать 0 сохраняет ранее известную частоту.
+Три байтовых контрола будет записывать SET-путь — он по-прежнему ждёт трейса;
+поля объявлены здесь, чтобы правило «unknown — это не 0» было записано один раз.
+Синхронизации у кэша пока нет и она не нужна: единственный писатель сейчас —
+`StartDevice` на PASSIVE_LEVEL, до того как у устройства появляется IOCTL-клиент.
+С версионными IOCTL (тот же отложенный шаг) придётся выбирать: либо spin-замок на
+четыре ULONG, либо атомарные обмены по полю — плановый тест №6 («панель меняет
+настройки во время потока») решит это не раньше, чем появится сама панель.
+
+Тесты (`driver/utest.sh`, теперь три бинарника): к парсеру добавился случай
+alt-lookup — 182 проверки, среди них 4ch@192 кГц обязан вернуть NULL
+(единственная комбинация, которую M5 требует корректно отклонять), границы
+непрерывного диапазона включительно, и дискретный + непрерывный alt в одном
+устройстве дают предсказуемый ответ. `driver/tests/emu_statetest.cpp` — 42
+проверки против разобранного, а не заполненного руками `EMU_DEVICE_CAPS`;
+фикстура 0404 вынесена в `driver/tests/descfixture.h`, чтобы у обоих тестов был
+один и тот же device. `utest.sh` умеет линковать на единицу теста несколько
+модулей: `state` собирает `emu_state.cpp` **и** `emu_desc.cpp` — иначе проверка
+«кэш следует за дескриптором» была бы проверкой собственных ожиданий теста.
+
+Проверено: image 33280 → 33792 Б, `dumpbin /imports` по-прежнему
+`ntoskrnl.exe` + `portcls.sys`, сборка без warning'ов, `./utest.sh` — 3 из 3,
+`smoke.sys` и `sample.sys` линкуются. На железе не проверено по-прежнему ничего
+из того же списка, что и в этапе 2: чем отвечает `GET_CUR` clock-rate на живом
+0404 (то есть наполняется ли кэш чтениями), и принимает ли устройство те alt'ы,
+которые назвал парсер.
+
+### USB-клиент M2, этап 4a: контракт панели описан числами и проверен (2026-11-04)
+
+Раздел «IOCTL-контракт» требовал закрыть набор операций до того, как появится
+панель, которая будет его звать. Закрыт кодом, а не текстом: `Emu/emu_ioctl.h` —
+единственный заголовок, который знают и драйвер, и будущая панель;
+`Emu/emu_ioctl.cpp` — правило, но не IRP. Третий двойной исходник в том же
+смысле, что `emu_desc.cpp` и `emu_state.cpp`: он компилируется флагами ядра
+обязательно, поэтому проверяемое правило и есть то, что уедет в образ.
+
+Почему решение вынесено из обработчика. Копирование буфера и вызов
+`PcDispatchIrp` без живого устройства не воспроизвести, а ошибка в этом месте — не
+«панель показала ерунду», а неправильный ответ чужому стеку: тот же
+`EmuPnpHandler` из M1 живёт ровно потому, что всё остальное он отдаёт PortCls
+нетронутым. Поэтому `EmuIoctlClassify` получает три числа (control code, длины
+входного и выходного буфера) и флаг «устройство пригодно», а возвращает
+действие + статус + размер ответа. Чужой код — это `EmuIoctlForward`: ничего не
+отгадывать и не отвергать по диапазону. Соседняя функция `0x802` в том же типе
+устройства тоже уходит в PortCls — сборка, которая его не определила, не вправе
+притворяться его владельцем. Проверено, что KS-запросы (`FILE_DEVICE_KS` = 0x2f,
+`shared/ks.h:74`) не пересекаются с нашими 0x22: иначе пересылка была бы дырой,
+а не защитой.
+
+`EMU_CAPS_INFO` заполняется из разобранных `EMU_DEVICE_CAPS`, а не из
+предположений теста: `RenderAltCount`/`CaptureAltCount` — из `EmuCapsAltCount`,
+список частот — из `EmuCapsRateList` (дедуп по всем alt'ам, по возрастанию,
+`EMU_RATES_CONTINUOUS`/`EMU_RATES_TRUNCATED` вместо правки на глаз), unit id —
+из `EmuCapsXuUnitId`. `SupportedMask` говорит про железо, `ImplementedMask` —
+про сборку, и тест настаивает, что на 0404 они не равны: все четыре SET-единицы
+на месте, ни один SET не отвечает. Остаток массива `Rates` обнуляется намеренно:
+METHOD_BUFFERED отдаёт клиенту весь размер структуры, и не записанные хвосты
+были бы содержимым ядра.
+
+В `EmuState` к этим же полям добавился `Sequence`: счётчик принятых заметок,
+нулевой после `EmuSettingsInit`. Нужен он, чтобы опрос не терял изменение,
+которое вернуло прежнее значение (48 → 96 → 48 кГц выглядит как «ничего не
+произошло»), а в `EMU_STATE_INFO` он переезжает как `StateSequence` рядом с
+`StartCount`.
+
+`EmuCapsRateList` — та часть парсера, что раньше была не нужна: пробник
+опрашивал одну частоту, панели нужен список. Заодно первый случай в этом плане,
+где «нет ответа» отличается от «пустой ответ»: у непрерывного alt'а перечислимого
+членства нет, поэтому `RateCount` = 0 плюс флаг, а не молчаливое «частот нет».
+
+Тесты: `driver/utest.sh` — четыре бинарника, `ioctl` — 163 проверки (пересылка
+чужих кодов, порядок отказов, размеры буферов, заполнение caps на 0404 и на
+устройстве без XU-единиц, unknown/known в state, смещения полей). У парсера
+добавился случай rate-list (209 проверок: дедуп, усечение с флагом,
+`MaxRates` = 0, непрерывный диапазон, дискретный + непрерывный вместе), у кэша —
+счётчик заметок (58). Отдельно зафиксировано смещения: панель — отдельный бинарь
+и компилируется в другой раз, поэтому переставленное поле должно ронять сборку,
+а не показывать на экране чужое число. Заодно шаг 1 для `emu_ioctl.cpp`
+подтверждает, что `DEFINE_GUID` из этого заголовка компилируется флагами ядра —
+без этого этап 4b начал бы с вопроса, а не с ответа.
+
+В образ `emu_ioctl.cpp` ещё не входит — подключается вместе с обработчиком
+(этап 4b), мёртвый объект в линке ничего бы не доказал. Проверено: сборка
+без warning'ов, `smoke.sys` и `sample.sys` линкуются, `./utest.sh` — 4 из 4.
+На железе не проверено по-прежнему ничего из списка этапа 2 и 3.
+
+### USB-клиент M2, этап 4b: обработчик IOCTL и control interface (2026-11-04)
+
+Контракт соединён с IRP-миром. `Emu/emu_disp.cpp` — обработчик
+`IRP_MJ_DEVICE_CONTROL`: чужие коды (KS/wdmaud и всё неизвестное) —
+`PcDispatchIrp` нетронутыми, ровно как они ходили до обработчика; свои —
+`EmuIoctlClassify` + заполнение `SystemBuffer` через `EmuIoctlFillCaps`/
+`EmuIoctlFillState`, `Information = OutputBytes`. Правило «когда экземпляр
+вообще отвечает» вынесено из обработчика в проверяемый модуль:
+`EmuIoctlIsDeviceUsable(State, Caps)` — только `EMU_WIRE_STATE_STARTED` с
+неравным NULL `Caps`; обработчик передаёт ему `State` атомарным чтением и
+`Caps` напрямую, а тест (`utest.sh ioctl`, теперь 171 проверка) прогоняет все
+пять состояний плюс оба «начат, но USB-клиент уже освободился» варианта.
+
+Три решения этапа, которые иначе было бы не поймать:
+
+* **StateLock (`FAST_MUTEX` в контексте) вместо надежды на remove lock.**
+  Remove lock защищает от REMOVE, но не от STOP: панель, открывшая handle до
+  disable/enable, может оказаться внутри `GET_CAPS` в тот же момент, когда
+  `EmuUsbRelease` освобождает `Caps` — при Special Pool это мгновенный BSOD,
+  без него — чтение освобождённой памяти. Но причина глубже: разорванный на
+  два поля ответ — это ровно та ложь «0 Гц при валидной маске», против
+  которой всё существование `EMU_NO_VALUE`. Под замком теперь весь жизненный
+  цикл `Caps` и `Settings`: публикация в start (весь alloc+parse под замком,
+  читатель видит NULL или целую таблицу), все освобождения в release,
+  `EmuSettingsNoteRate` пробника, оба fill-пути. `USBD_CloseHandle` — вне
+  замка (ему нужен PASSIVE_LEVEL, замок работает на APC). Это и есть выбор из
+  этапа 3 («spin-замок или атомарные обмены»), назначенный по факту появления
+  IOCTL-клиентов.
+* **Обработчик — в непейджируемом `.text`, не в `PAGE`.** Он стоит перед
+  `PcDispatchIrp` для каждого device-control IRP стека, а KS property-трафик
+  PASSIVE_LEVEL не гарантирует; PAGED_CODE() в этой точке — скрытый bugcheck
+  в checked-сборке. Свой fill-путь проверяет IRQL сам (после пересылки чужих
+  кодов): DISPATCH-вызов нашего кода получает отказ, а не bugcheck под
+  FAST_MUTEX. Секции после сборки проверены: `.text` с битом Not Paged,
+  `PAGE` = `60000020`, `INIT` — discardable.
+* **REMOVE при так и не стартовавшем экземпляре больше не вызывает
+  `EmuUsbRelease`.** Начатый и упавший на layout-гварде экземпляр имеет
+  Signature == 0 и неинициализированный StateLock — старый вызов был
+  бесплатным no-op'ом по нулевым полям, теперь это неинициализированный мьютекс.
+  Guard по Signature: ресурсов нет — освобождать нечего.
+
+Control interface. `IoRegisterDeviceInterface(PDO)` — один раз на экземпляр,
+но попытка повторяется, пока имени нет (старт, упавший до регистрации,
+повторяется сам). Включение — только после `State = Started` (панель, выигравшая
+гонку с enable, читает рабочее устройство, а не «полустарт»); выключение — на
+STOP (до release: открывающий во время стопа получает «no such device», а не
+устройство, отвечающее «not ready») и перед REMOVE, имя освобождается до
+`PcDispatchIrp` — после форвардинга расширение недостижимо. На
+SURPRISE_REMOVAL интерфейс **намеренно** остаётся включённым: открытая панель
+до завершения remove получает наши честные отказы «device not ready», и
+регистрацию закрывает сам PnP-менеджер. Ошибка регистрации — провал старта
+(этап 8 control-plane-цепочки, откат `EmuUsbRelease` в обратном порядке);
+ошибка включения — только WARN: регистрация стоит, устройство живо, сломан
+только доступ панели.
+
+Прочее по этапу: `C_ASSERT` связал `EMU_STATE` с `EMU_WIRE_STATE_*`
+(emu.h — обещание из emu_ioctl.h теперь проверяется компиляцией); GUID
+определяется ровно в одном TU — `emu_pnp.cpp` первым включает `<initguid.h>`,
+во всех остальных и в user-mode тестах `DEFINE_GUID` остаётся объявлением;
+`inf/openemu-ks.inf` получил `[Emu0404.Install.Interfaces]` +
+`AddInterface` с тем же GUID-строкой (Inf2Cat — 0 ошибок); список исходников
+в `kinstall.ps1 -Build` и BUILD.md дополнен `emu_disp.cpp` + `emu_ioctl.cpp`.
+Образ 33792 → 38400 Б, `dumpbin /imports` по-прежнему только
+`ntoskrnl.exe` + `portcls.sys`, `./utest.sh` — 4 из 4 (desc 209, ctrl 123,
+state 58, ioctl 171), `smoke.sys` и `sample.sys` линкуются.
+
+**Не проверено на железе — и это теперь главный вопрос этапа:** дойдёт ли
+`CreateFile` по symbolic link интерфейса до FDO как `IRP_MJ_CREATE`, который
+PortCls примет. Открытие handle'а на адаптерном FDO решает KS-dispatch
+PortCLS, а не наш код, и без живого устройства это утверждение — предположение
+с лучшей на сегодня аргументацией (device-level KS handles). Если PortCls
+CREATE отвергнет — это та развилка, при которой возвращается control-PDO из
+«PnP-схемы (исправлено)». Дальше по списку: roundtrip `GET_CAPS`/`GET_STATE`
+от тестового клиента, открытый handle на время disable/enable (тот самый
+StateLock-путь), открытие выключенного интерфейса (ожидается
+`ERROR_FILE_NOT_FOUND`), и весь отложенный список M1-акцептанса — на его
+трейсе заодно решатся GET_CUR и SET_CUR.
+
 ## Тесты (обязательные)
 
 1. Parser: реальные дескрипторы всех моделей, malformed lengths, лишние
-   endpoint'ы, превышение размеров массивов.
+   endpoint'ы, превышение размеров массивов. **Часть закрыта 2026-11-04**
+   (`driver/utest.sh desc`: malformed lengths, лишние/переставленные endpoint'ы,
+   переполнение массивов, оба XU-layout, поиск alt по частоте и направлениям
+   (в том числе 4ch@192 кГц = NULL) и список частот с дедупом и усечением —
+   209 проверок, `RESULT: PASS`);
+   реальные дескрипторы всех моделей — после `emu-dump -o docs/descriptors`.
 2. Packet scheduling: 44.1/48/88.2/96/176.4/192 кГц, wrap StartFrame, поздняя
    отправка, предельный packet size.
 3. 24↔32 conversion: ноль, максимум, минимум, −1, знаковое расширение,
@@ -358,6 +803,24 @@ devnode в problem'е и `STATUS_DEVICE_CONFIGURATION_ERROR` в логе) и ч�
 8. Driver Verifier: Special Pool, Force IRQL Checking, PnP/Power checks,
    отдельно Low Resources Simulation. Первые запуски — на тестовой машине с
    kernel debugger и crash dump, не на рабочей системе.
+9. Раскладка class-запросов EP0: восемь setup-байтов каждого `SET_CUR`/`GET_CUR`
+   против v1-движка, границы полей и кодировки значений. **Закрыто 2026-11-04**
+   (`driver/utest.sh ctrl`: 123 проверки, `RESULT: PASS`); принятие этих байтов
+   hardware'ом — из того же M1-трейса.
+10. Кэш состояния: то, против чего говорит дескриптор, не записывается и не
+    затирает уже известное; до первого подтверждения каждое поле — «неизвестно»,
+    а не ноль; счётчик принятых заметок двигают только принятые.
+    **Закрыто 2026-11-04** (`driver/utest.sh state`: 58 проверок,
+    `RESULT: PASS`); наполняется ли кэш чтениями, решает ответ `GET_CUR` на
+    живом устройстве.
+11. Контракт панели: чужой control code уходит PortCls нетронутым, refusal для
+    «не готово»/несовместимых буферов, `Size`/`Version`, несовпадение
+    `SupportedMask` и `ImplementedMask`, `ValidMask` против `EMU_NO_VALUE`,
+    смещения и размеры обоих ответов, правило «когда экземпляр отвечает»
+    (`EmuIoctlIsDeviceUsable`). **Закрыто 2026-11-04**
+    (`driver/utest.sh ioctl`: 171 проверка, `RESULT: PASS`); что панель реально
+    получит по этим IOCTL, покажет живое устройство — обработчик и регистрация
+    interface написаны (этап 4b), но ни один запрос по ним ещё не ходил.
 
 ## Что починить в v1 перед заморозкой
 
@@ -388,10 +851,14 @@ USB-, PnP- и аудиостека.
   собирается и подписывается: `driver/emuusbaudio/build/smoke.sys`.
 * `driver/kbuild.sh`: `-kernel -GS-`; порядок include'ов `km\crt → ucrt → um →
   shared → MSVC → km → shared` (иначе взрывается `_CRTIMP_ALT`); libs:
-  ntoskrnl/hal/wdm/libcntpr + portcls/stdunk/ksguid/ks +
-  wdfdriverentry/wdfldr (KMDF 1.35). Пути находятся сами (MSI-layout
-  `Windows Kits\10`, либо NuGet `<root>/c/Include`); переопределение —
-  `OED_VS/OED_MSVC/OED_KITS/OED_SDKVER/OED_WDFVER/OED_NTDDI`.
+  ntoskrnl/hal/wdm/libcntpr + portcls/stdunk/ksguid/ks + bufferoverflowk +
+  usbd/usbdex + wdfdriverentry/wdfldr (KMDF 1.35). Ссылочно-неиспользуемые
+  библиотеки образ не меняют: каркас M1 по-прежнему импортирует только
+  `ntoskrnl.exe` и `portcls.sys`. Обязательная пара к `/GS`-либам —
+  `-NODEFAULTLIB:LIBCMT.lib` + `BufferOverflowK.lib` (см. «Подготовка M2»),
+  иначе driver-линк тонет в user-mode `gs_report`. Пути находятся сами
+  (MSI-layout `Windows Kits\10`, либо NuGet `<root>/c/Include`);
+  переопределение — `OED_VS/OED_MSVC/OED_KITS/OED_SDKVER/OED_WDFVER/OED_NTDDI`.
   Для исходников сэмпла нужен `-D_NEW_DELETE_OPERATORS_` (иначе placement-new
   из `NewDelete.cpp` не компилируется и линковка не сходится).
 * Форматные таблицы: `speakerwavtable.h`/`micarraywavtable.h` + `minipairs.h` →
