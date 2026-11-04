@@ -215,9 +215,9 @@ output достаточного размера — иначе `STATUS_INVALID_PA
 | --- | --- |
 | v1 ASIO/WinUSB | Зрелая часть: ASIO COM DLL, панель, диагностика, INF, packed-24 streaming, явное кадровое планирование. На 0404 (fw 8.04) заявлены 44.1/48/96/192 кГц, 2/4 канала |
 | v2 kernel | Каркас: SimpleAudioSample, smoke.c, ручной kbuild.sh, план. Последний коммит — WIP |
-| USB в kernel | **Стартует на живой 0404**: contract-602 клиент (`USBD_CreateHandle`), GET_DESCRIPTOR (1832 Б) + парсер в `EMU_DEVICE_CAPS` (выправлен по реальным байтам), транспорт class-запросов EP0, read-only пробник clock-rate (отвечает 0xC000000D — разбирается), кэш четырёх панельных контролов, обработчик приватных IOCTL, control interface зарегистрирован и включён. Отсутствует: доступный панели handle (KS отвергает CREATE на FDO — этап 4c), выбор конфигурации и alt, `SET_CUR` на живом железе, URB-кольцо, interrupt EP, feedback, iso-движок |
+| USB в kernel | **Стартует на живой 0404 и отвечает на IOCTL**: contract-602 клиент, GET_DESCRIPTOR (1832 Б) + парсер (выправлен по реальным байтам), транспорт class-запросов EP0, read-only пробник clock-rate (0xC000000D — разбирается), кэш четырёх контролов, контрольное устройство `\\.\EmuUSBAudioCtl` с roundtrip `GET_CAPS`/`GET_STATE` (`emu-probe: PASS`). Отсутствует: `SET_CUR` на живом железе, выбор конфигурации и alt, URB-кольцо, interrupt EP, feedback, iso-движок |
 | PortCLS | Практически исходный сэмпл: stereo/16-bit/48 kHz, ToneGenerator, программный таймер, эмуляция DMA-позиции |
-| INF / ASIO / панель v2 | Панель и ASIO не реализованы. Контракт панели описан, покрыт тестом и установлен на железо; интерфейс включён, но KS отвергает `IRP_MJ_CREATE` на FDO — панель-обращение упирается в этап 4c (контрольный device object); пробник контракта — `driver/tools/emu_probe.c` (`driver/kprobe.sh`) |
+| INF / ASIO / панель v2 | Панель и ASIO не реализованы. Контракт панели описан, покрыт тестом и **проверен на железе через контрольное устройство** (`emu-probe: PASS`, `GET_CAPS`/`GET_STATE`); пробник — `driver/tools/emu_probe.c` (`driver/kprobe.sh`) |
 | Воспроизводимость | M0 выполнен: `build.sh` и `driver/kbuild.sh` сами находят компилятор, WDK и SDK (локальные пути убраны), подпись вынесена в `driver/ksign.ps1`, `ref/` поднимается по запросу `tools/get-ref.sh`, дамп дескрипторов сохраняется `emu-dump -o`. Юнит-тесты двойных исходников — `driver/utest.sh` (парсер, EP0-запросы, кэш, IOCTL-контракт). Инструкция и фактические проверки — `docs/BUILD.md`. CI по-прежнему нет |
 
 ## Этапы и критерии готовности
@@ -228,7 +228,7 @@ output достаточного размера — иначе `STATUS_INVALID_PA
 | --- | --- | --- |
 | M0. База и воспроизводимость | ✅ сделано 2026-11-04 (см. «Итог M0»): v1 tag'ом; убрать локальные пути из сборки (поиск тулчейна вместо MSBuild-проекта — `.vcxproj` из сэмпла ещё не подключены); отдельный signing-скрипт; восстановить или удалить ссылки на `ref/`; сохранять descriptor dumps | Чистая машина собирает v1 и smoke/v2 по инструкции — **выполнено на новой машине без WDK** |
 | M1. PnP-каркас 0404 | 🟡 2026-11-04: каркас написан и упакован (см. «Итог M1») — `driver/emuusbaudio/Emu/{emu.h,emu_driver.cpp,emu_pnp.cpp}`, `inf/openemu-ks.inf`, `driver/kinstall.ps1`, `driver/ksoak.ps1`. `PcAddAdapterDevice`, device context, remove lock, start/stop/remove/surprise-remove. Без аудио | 50 циклов disable/enable и remove/replug под Driver Verifier без утечек и BSOD — **не выполнено**: на этой машине нет 0404 и нет админ-прав; прогон §9 `docs/BUILD.md` на тестовой машине |
-| M2. USB + управление | Выбор конфигурации, parser capabilities, EP0 SET_CUR, кэш состояния, версионные IOCTL, безопасная регистрация device interface. **База проверена 2026-11-04**: USB-API доступено и линкуется (см. «Подготовка M2»); парсер дескрипторов + плановый тест №1 готовы (см. «Парсер дескрипторов и плановый тест №1»), сборка EP0-запросов и её тест — тоже (см. «Контрольные запросы EP0»), транспорт class-запросов и read-only пробник clock-rate встроены в `StartDevice` (см. «этап 2»; на нём же держится кэш состояния — `Emu/emu_desc.{h,cpp}` вопросы по частотам/alt, `Emu/emu_state.{h,cpp}` кэш и его тест, см. «этап 3»); набор операций и раскладка ответов описаны кодом и тестом («этап 4a»), обработчик `IRP_MJ_DEVICE_CONTROL` + `IoRegisterDeviceInterface` + `.Interfaces` в INF написаны («этап 4b»); **старт на живой 0404 состоялся** (см. «Железный прогон M2»), парсер выправлен по реальному дескриптору, фикстура заменена дампом; не решено: `CreateFile` на FDO отвергается KS (этап 4c — контрольный device object), GET_CUR-пробник отвечает 0xC000000D, реальной отправки `SET_CUR` и выбора конфигурации нет | Панель отдельно меняет rate/clock/S/PDIF/soft limit; WinUSB одновременно не открывается |
+| M2. USB + управление | Выбор конфигурации, parser capabilities, EP0 SET_CUR, кэш состояния, версионные IOCTL, безопасная регистрация device interface. **База проверена 2026-11-04**: USB-API доступено и линкуется (см. «Подготовка M2»); парсер дескрипторов + плановый тест №1 готовы (см. «Парсер дескрипторов и плановый тест №1»), сборка EP0-запросов и её тест — тоже (см. «Контрольные запросы EP0»), транспорт class-запросов и read-only пробник clock-rate встроены в `StartDevice` (см. «этап 2»; на нём же держится кэш состояния — `Emu/emu_desc.{h,cpp}` вопросы по частотам/alt, `Emu/emu_state.{h,cpp}` кэш и его тест, см. «этап 3»); набор операций и раскладка ответов описаны кодом и тестом («этап 4a»), обработчик `IRP_MJ_DEVICE_CONTROL` + `IoRegisterDeviceInterface` + `.Interfaces` в INF написаны («этап 4b»); **старт на живой 0404 состоялся** (см. «Железный прогон M2»), парсер выправлен по реальному дескриптору, фикстура заменена дампом; CreateFile решён этапом 4c — контрольное устройство `\\.\EmuUSBAudioCtl`, `emu-probe: PASS` на железе (первый IOCTL-roundtrip); GET_CUR-пробник отвечает 0xC000000D (разбирается), реальной отправки `SET_CUR` и выбора конфигурации нет | Панель отдельно меняет rate/clock/S/PDIF/soft limit; WinUSB одновременно не открывается |
 | M3. Kernel ISO без PortCLS | Временный test-only IOCTL для 48 kHz stereo render/capture: URB-кольцо, StartFrame, статистика ошибок | Синус на OUT и loopback capture работают независимо от PortCLS; тестовый интерфейс удалён из release |
 | M4. Минимальный WaveRT | Только 48 kHz, 2 канала, 24-in-32. Сначала render, затем capture. Реальные буферы вместо ToneGenerator, USB-позиция, notifications | WASAPI render и capture + wasapi-test проходят; generator/savedata/timing emulation удалены |
 | M5. Форматы и full duplex | Все частоты 0404, затем 4 канала 44.1–96 кГц, feedback, external clock, обработка xruns | Все разрешённые сочетания работают; запрещённые (4ch/192k) корректно отклоняются |
@@ -758,10 +758,9 @@ SURPRISE_REMOVAL интерфейс **намеренно** остаётся вк
 
 Прочее по этапу: `C_ASSERT` связал `EMU_STATE` с `EMU_WIRE_STATE_*`
 (emu.h — обещание из emu_ioctl.h теперь проверяется компиляцией); GUID
-определяется ровно в одном TU — `emu_pnp.cpp` первым включает `<initguid.h>`,
-во всех остальных и в user-mode тестах `DEFINE_GUID` остаётся объявлением;
-`inf/openemu-ks.inf` получил `[Emu0404.Install.Interfaces]` +
-`AddInterface` с тем же GUID-строкой (Inf2Cat — 0 ошибок); список исходников
+определяется ровно в одном TU (`<initguid.h>` — с этапа 4c в
+`emu_driver.cpp`, который передаёт его `IoCreateDeviceSecure`);
+список исходников
 в `kinstall.ps1 -Build` и BUILD.md дополнен `emu_disp.cpp` + `emu_ioctl.cpp`.
 Образ 33792 → 38400 Б, `dumpbin /imports` по-прежнему только
 `ntoskrnl.exe` + `portcls.sys`, `./utest.sh` — 4 из 4 (desc 209, ctrl 123,
@@ -821,10 +820,40 @@ Filter\IHVDRIVER`) читается только при загрузке, мас
 registry-breadcrumb'ом. Свежий трейс стартовавшего драйвера (caps-таблица,
 hex) получить пока не удалось — канал настроить до следующего прогона.
 
-Дальше по списку: этап 4c (контрольный device object + roundtrip
-`GET_CAPS`/`GET_STATE`), разбор GET_CUR-отказа, ksoak (50 циклов disable/
-enable + remove/replug) и Driver Verifier — ksoak от панели не зависит и
-идёт сразу после 4c.
+### Этап 4c: контрольное устройство и первый IOCTL-roundtrip (2026-11-04)
+
+Опровержение из прогона реализовано немедленно: DriverEntry создаёт
+именованный device object `\Device\EmuUSBAudioCtl` (IoCreateDeviceSecure,
+SDDL «SYS_ALL_ADM_ALL» — та же политика, что в INF для FDO) с симлинком
+`\??\EmuUSBAudioCtl` (симлинк NT-имени), удаляется в DriverUnload до chain-вызова PortCls.
+Панель открывает `\\.\EmuUSBAudioCtl`; CREATE/CLOSE/CLEANUP этого DO
+обрабатывает драйвер сам, DEVICE_CONTROL — по тому же контракту, а FDO
+дискриминируется по DeviceType (FILE_DEVICE_SOUND против
+FILE_DEVICE_UNKNOWN) плюс сигнатуре первого ULONG расширения — на FDO-пути
+всё чужое по-прежнему уходит `PcDispatchIrp`. Ответ собирается из
+глобального указателя на текущий стартовавший экземпляр (публикуется в
+конце старта, снимается в stop/remove): контрольный путь держит
+ObReferenceObject на FDO и его remove lock, поэтому panel handle на
+контрольном устройстве не может пережить контекст, из которого читает —
+заполнение по-прежнему под StateLock. PDO-регистрация интерфейса,
+enable/disable и breadcrumb из этапа 4b удалены как мёртвые (секция
+`.Interfaces` из INF тоже); пробник переключён на прямой CreateFile
+(`driver/tools/emu_probe.c`).
+
+**Результат на железе: `emu-probe: PASS`.** `GET_CAPS` вернул таблицу
+живого дескриптора (16 render + 16 capture альтов, 4 канала, 6 дискретных
+частот, юниты 0x0C-0x0F, monitor/metering — EMU_NO_VALUE, feature unit
+0x04 master 0x01, status EP 0x83), `GET_STATE` — все четыре контрола
+"unknown" с `pnp state = started` и счётчиками start 1/stop 0/remove 0.
+ImplementedMask (get-caps, get-state) и SupportedMask (все шесть) расходятся
+ровно так, как требует контракт. Первый IOCTL-roundtrip драйвера с
+user-mode состоялся.
+
+Дальше: ksoak (50 циклов disable/enable + remove/replug) и Driver Verifier;
+разбор GET_CUR-пробника (0xC000000D) — на трейсе рабочего канала захвата.
+Примечание к пробам 4b: root-причина «интерфейс не включается» была
+ложной — pnputil показывал «Включено» с самого начала, настоящий отказ
+происходил в KS на CREATE.
 
 ## Тесты (обязательные)
 

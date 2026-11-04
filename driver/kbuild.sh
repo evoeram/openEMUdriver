@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 # Kernel build harness for the EmuUSBAudio PortCLS driver.
 #
 #   kbuild.sh <out.sys> <src...>          run from anywhere
@@ -27,7 +27,7 @@ export PATH="$MSVC/bin/Hostx64/x64:$PATH"
 export MSYS_NO_PATHCONV=1
 
 # Kernel /GS support (see the link line below) and the USB helper libraries.
-for l in ntoskrnl hal wdm libcntpr portcls stdunk ksguid ks usbd usbdex bufferoverflowk; do
+for l in ntoskrnl hal wdm libcntpr portcls stdunk ksguid ks usbd usbdex bufferoverflowk wdmsec; do
     ls "$WDK_LIB/$SDKVER/km/x64/$l.lib" >/dev/null 2>&1 || err "link library missing: $l.lib (WDK $SDKVER km/x64)"
 done
 for l in wdfdriverentry wdfldr; do
@@ -64,6 +64,6 @@ done
 "$LINK" -nologo -DRIVER -SUBSYSTEM:NATIVE "-OUT:$OUT" -ENTRY:DriverEntry \
         -INCREMENTAL:NO -NODEFAULTLIB:LIBCMT.lib \
         $OBJS ntoskrnl.lib hal.lib wdm.lib libcntpr.lib \
-        portcls.lib stdunk.lib ksguid.lib ks.lib bufferoverflowk.lib \
+        portcls.lib stdunk.lib ksguid.lib ks.lib bufferoverflowk.lib wdmsec.lib \
         usbd.lib usbdex.lib wdfdriverentry.lib wdfldr.lib
 echo "BUILT: $OUT  (MSVC $MSVC_VER, kits $(cygpath -w "$KITS_UNIX"), SDK $SDKVER, WDF $(basename "$WDF_LIB"))"

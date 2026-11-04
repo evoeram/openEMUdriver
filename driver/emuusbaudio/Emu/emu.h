@@ -55,11 +55,6 @@ extern "C" {
 
 extern ULONG EmuTraceLevel;
 
-// The service key path, copied out of DriverEntry: the PnP manager's
-// buffer is only guaranteed while DriverEntry runs, and the interface
-// breadcrumb below writes into the Parameters subkey long after that.
-extern UNICODE_STRING EmuDriverRegistryPath;
-
 // PnP state of one device instance. Stored as a LONG and written with
 // InterlockedExchange so later stages (IOCTLs, stream threads) can read it
 // without taking a lock.
@@ -101,6 +96,7 @@ C_ASSERT(sizeof(PORT_CLASS_EXTENSION) == 64);
 // fresh instance reads Signature == 0.
 #define EMU_CTX_SIGNATURE 0x43656D75 // 'uCem'
 
+
 typedef struct _EMU_DEVICE_CONTEXT {
     ULONG          Signature;
     LONG           State;           // EMU_STATE, read/written interlocked
@@ -121,15 +117,6 @@ typedef struct _EMU_DEVICE_CONTEXT {
     // the PnP manager serializes START against STOP on top of it.
     FAST_MUTEX     StateLock;
 
-    // M2 stage 4b: the private control interface the panel opens. Registered
-    // against the PDO once per instance (the registration is PnP registry
-    // state and survives stop/start), enabled only after a start that parsed
-    // the descriptor, and disabled on stop and before removal. The name buffer
-    // comes from IoRegisterDeviceInterface and is freed at REMOVE, before the
-    // extension dies inside PcDispatchIrp.
-    UNICODE_STRING ControlInterfaceName;
-    BOOLEAN        ControlInterfaceEnabled;
-
     // M2 USB client state. The handle registers this driver with the USB stack
     // under contract 602; the descriptor block and the parsed caps are pool
     // allocations — EMU_DEVICE_CAPS is a few kilobytes and the PortCls
@@ -146,6 +133,22 @@ typedef struct _EMU_DEVICE_CONTEXT {
     EMU_SETTINGS                  Settings;
 } EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
+// Stage 4c: the panel talks to a driver-owned control device object, not to
+// the FDO. Hardware run 2026-11-04 proved that KS/PortCls rejects
+// IRP_MJ_CREATE on the adapter FDO (no create item matches an empty file
+// name), so the interface on the PDO could never be opened. The control
+// device carries this signature in its first extension ULONG, which is how
+// the shared dispatch tells it apart from the FDO (whose extension starts
+// with the PortCls region).
+#define EMU_CTL_SIGNATURE 0x4C74436D // 'mCtL'
+
+// The started adapter instance, published for the control device's dispatch.
+// Set at the end of a successful start, cleared on stop and remove; read
+// atomically, and guarded by the FDO's remove lock plus an object reference
+// while in use (a panel handle on the control device must not outlive the
+// context it reads).
+extern PEMU_DEVICE_CONTEXT EmuControlAdapter;
+
 #define EMU_CONTEXT(Fdo) \
     ((PEMU_DEVICE_CONTEXT)((PCHAR)(Fdo)->DeviceExtension + PORT_CLASS_DEVICE_EXTENSION_SIZE))
 
@@ -156,10 +159,15 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 extern "C" DRIVER_ADD_DEVICE AddDevice;
 extern "C" DRIVER_DISPATCH   EmuPnpHandler;
 
-// emu_disp.cpp — explicit prototype, not a DRIVER_DISPATCH declaration, per the
-// M1 note about typedef-typed declarations: a function type typedef makes the
-// bare form work, a pointer typedef silently declares a variable instead.
+// emu_disp.cpp — explicit prototypes, not DRIVER_DISPATCH declarations, per
+// the M1 note about typedef-typed declarations: a function type typedef makes
+// the bare form work, a pointer typedef silently declares a variable instead.
 extern "C" NTSTATUS NTAPI EmuDeviceControlHandler(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP        Irp
+    );
+
+extern "C" NTSTATUS NTAPI EmuCreateCloseHandler(
     _In_ PDEVICE_OBJECT DeviceObject,
     _Inout_ PIRP        Irp
     );

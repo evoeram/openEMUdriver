@@ -1,4 +1,4 @@
-# Сборка openEMUdriver
+﻿# Сборка openEMUdriver
 
 Инструкция для чистой машины. Два независимых контура: **v1** (user-mode,
 MinGW-w64) и **v2** (kernel PortCLS, MSVC + WDK). v1 не зависит от WDK, v2 не
@@ -85,10 +85,10 @@ cd driver
 без KMDF — `dumpbin /imports` даёт только `ntoskrnl.exe` и `portcls.sys`,
 включая сборку M2 целиком (`emu_usb.cpp`, `emu_desc.cpp`, `emu_ctrl.cpp`,
 `emu_state.cpp`, `emu_ioctl.cpp`, `emu_disp.cpp`): `usbdex.lib` статический,
-поэтому `USBD.SYS` в импортах не появляется. GUID контрольного интерфейса
-определяется ровно в одном TU — `emu_pnp.cpp` первым включает `<initguid.h>`,
-так что `DEFINE_GUID` из `Emu/emu_ioctl.h` разворачивается там в определение, а
-в остальных TU и в user-mode тестах остаётся extern-объявлением.
+поэтому `USBD.SYS` в импортах не появляется. GUID класса контрольного
+устройства определяется ровно в одном TU — `emu_driver.cpp` первым включает
+`<initguid.h>`, так что `DEFINE_GUID` из `Emu/emu_ioctl.h` разворачивается там
+в определение, а в остальных TU и в user-mode тестах остаётся extern-объявлением.
 
 Одна ловушка именно для C++-TU: `usbdex.lib` экспортирует плоские C-имена, а
 `<usbdlib.h>` в C++ манглит объявления, и линк даёт LNK2019 на

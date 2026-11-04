@@ -1,23 +1,20 @@
-// emu-probe — user-mode client for the EmuUSBAudio control interface (M2 4b).
+// emu-probe — user-mode client for the EmuUSBAudio control device (M2 4c).
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // The panel does not exist yet; this tool is its stand-in for the hardware run.
-// It enumerates GUID_DEVINTERFACE_EMUUSBAUDIO, opens the handle (the CreateFile
-// itself is the stage's open question: does IRP_MJ_CREATE reach the FDO through
-// PortCls at all) and issues both queries of driver/emuusbaudio/Emu/emu_ioctl.h
-// — the same header a real panel would compile — printing every field with its
-// "unknown" semantics intact. Exit code 0 when both IOCTLs were answered.
+// It opens the driver-owned control device — the hardware run of 2026-11-04
+// proved that IRP_MJ_CREATE on the adapter FDO is answered by KS and rejected,
+// so the panel goes through \\.\EmuUSBAudioCtl instead — and issues both
+// queries of driver/emuusbaudio/Emu/emu_ioctl.h, the same header a real panel
+// would compile, printing every field with its "unknown" semantics intact.
+// Exit code 0 when both IOCTLs were answered.
 //
 // Everything here is read-only by construction: the contract has no write codes
 // yet, so the worst this tool can do is ask questions the driver refuses.
 #define WIN32_NO_STATUS        // STATUS_* must come from ntstatus.h, not winnt.h
 #include <windows.h>
 #include <stdio.h>
-// initguid first: the contract header's DEFINE_GUID becomes the one definition
-// in this binary, exactly as in emu_pnp.cpp on the kernel side.
-#include <initguid.h>
 #include "emu_ioctl.h"
-#include <setupapi.h>
 
 static const char* PnpStateName(ULONG s)
 {
@@ -134,10 +131,6 @@ static void PrintWin32Error(const char* what, DWORD err)
 
 int main(int argc, char** argv)
 {
-    HDEVINFO set;
-    SP_DEVICE_INTERFACE_DATA iface;
-    SP_DEVICE_INTERFACE_DETAIL_DATA_A* detail = NULL;
-    ULONG size = 0;
     HANDLE h;
     EMU_CAPS_INFO caps;
     EMU_STATE_INFO state;
@@ -147,63 +140,24 @@ int main(int argc, char** argv)
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
 
-    set = SetupDiGetClassDevsA(&GUID_DEVINTERFACE_EMUUSBAUDIO, NULL, NULL,
-                               DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (set == INVALID_HANDLE_VALUE) {
-        PrintWin32Error("SetupDiGetClassDevs", GetLastError());
-        return 1;
-    }
-
-    iface.cbSize = sizeof(iface);
-    if (!SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_EMUUSBAUDIO,
-                                     0, &iface)) {
-        DWORD err = GetLastError();
-        if (err == ERROR_NO_MORE_ITEMS) {
-            printf("no control interface registered: the driver has not run "
-                   "IoRegisterDeviceInterface (is openemu-ks.inf installed and "
-                   "the devnode started?)\n");
-        } else {
-            PrintWin32Error("SetupDiEnumDeviceInterfaces", err);
-        }
-        SetupDiDestroyDeviceInfoList(set);
-        return 1;
-    }
-
-    // Two-call detail query: first for the size, then for the path.
-    if (!SetupDiGetDeviceInterfaceDetailA(set, &iface, NULL, 0, &size, NULL) &&
-        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        PrintWin32Error("SetupDiGetDeviceInterfaceDetail(size)", GetLastError());
-        SetupDiDestroyDeviceInfoList(set);
-        return 1;
-    }
-    detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*)malloc(size);
-    if (detail == NULL) {
-        SetupDiDestroyDeviceInfoList(set);
-        return 1;
-    }
-    detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-    if (!SetupDiGetDeviceInterfaceDetailA(set, &iface, detail, size, NULL, NULL)) {
-        PrintWin32Error("SetupDiGetDeviceInterfaceDetail", GetLastError());
-        free(detail);
-        SetupDiDestroyDeviceInfoList(set);
-        return 1;
-    }
-    SetupDiDestroyDeviceInfoList(set);
-
-    printf("control interface: %s\n", detail->DevicePath);
-
-    // This call is the stage's open question: IRP_MJ_CREATE on the adapter FDO
-    // is dispatched by PortCls, not by this driver, and whether it is accepted
-    // on a live 0404 was never seen before this run.
-    h = CreateFileA(detail->DevicePath,
+    // The control device: driver-global, admin-only, present from DriverEntry
+    // to unload. A CREATE here is answered by the driver itself (stage 4c) —
+    // the hardware run showed the FDO's KS dispatch rejecting CREATE, which is
+    // exactly why this device exists.
+    h = CreateFileA("\\\\.\\EmuUSBAudioCtl",
                     GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     NULL, OPEN_EXISTING, 0, NULL);
-    free(detail);
     if (h == INVALID_HANDLE_VALUE) {
-        PrintWin32Error("CreateFile(control interface)", GetLastError());
+        DWORD err = GetLastError();
+        PrintWin32Error("CreateFile(control device)", err);
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            printf("  (the driver is not loaded: is openemu-ks.inf installed?)\n");
+        }
         return 1;
     }
+
+    printf("control device opened\n");
 
     memset(&caps, 0, sizeof(caps));
     if (!DeviceIoControl(h, EMU_IOCTL_GET_CAPS, NULL, 0,

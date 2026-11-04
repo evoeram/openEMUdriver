@@ -16,7 +16,7 @@ Class       = Media
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = openemu-ks.cat
-DriverVer   = 11/04/2026,2.0.0.6
+DriverVer   = 11/04/2026,2.0.0.7
 PnpLockdown = 1
 
 [SourceDisksNames]
@@ -43,18 +43,11 @@ AddReg    = EmuKs.AddReg
 [Emu0404.Install.HW]
 AddReg = EmuKs.HwAddReg
 
-; The private control interface the panel opens (M2 stage 4b). The driver does
-; the registration itself — IoRegisterDeviceInterface in StartDevice against the
-; PDO — and enables it only after a start that parsed the descriptor; this
-; section is the INF-side declaration of the same GUID, so the interface has an
-; owner in the package and not only in code.
-[Emu0404.Install.Interfaces]
-AddInterface = %EmuCtl.IfaceGuid%,, Emu0404.CtlIface
-
-[Emu0404.CtlIface]
-; No interface-specific registry data on purpose: the panel talks IOCTL through
-; the handle, and the two answer codes are declared in
-; driver/emuusbaudio/Emu/emu_ioctl.h (the same header the panel compiles).
+; No [Install.Interfaces] since stage 4c: the hardware run proved KS/PortCls
+; rejects IRP_MJ_CREATE on the adapter FDO, so a PDO-registered interface can
+; never be opened. The panel opens the driver-owned control device
+; \\.\EmuUSBAudioCtl instead (created in DriverEntry, admin-only); the IOCTL
+; contract lives in driver/emuusbaudio/Emu/emu_ioctl.h.
 
 [Emu0404.Install.Services]
 AddService = EmuUSBAudio,0x00000002,EmuKs.Service
@@ -92,7 +85,6 @@ MfgName         = "openEMUdriver project"
 DiskName        = "EmuUSBAudio Installation Disk"
 Emu0404.DeviceDesc = "E-MU 0404 USB (openEMUdriver kernel)"
 EmuKs.SvcDesc   = "EmuUSBAudio - openEMUdriver kernel transport"
-; The private control interface; the same GUID lives in
-; driver/emuusbaudio/Emu/emu_ioctl.h, which the panel compiles too. Changing
-; one without the other breaks only the panel — but silently.
-EmuCtl.IfaceGuid = "{6DC68D18-D4C8-4DAC-A456-6CA921953BE8}"
+; The panel-visible control device name is \\.\EmuUSBAudioCtl (stage 4c); its
+; class GUID lives in driver/emuusbaudio/Emu/emu_ioctl.h, which the panel
+; compiles too.
