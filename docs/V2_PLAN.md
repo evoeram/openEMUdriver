@@ -859,30 +859,65 @@ interface-дескриптора в блоке) + `EmuUsbSelectConfiguration`
 USBD_SelectConfigUrbAllocateAndBuild; URB и configuration handle живут в
 контексте весь старт — interface info живёт внутри URB-аллокации).
 **Железный вердикт: SelConfigStatus = 0 — SelectConfiguration прошёл на
-живой 0404** (маркер EntryBread=0x15 подтвердил свежий образ).
+живой 0404** (маркер EntryBread=0x15 подтвердил свежий образ). **Поправка
+2026-11-05: этот вердикт оказался ложноположительным** — статус 0 доказал
+билдер, а не шину; см. «Поправка M3-A» ниже.
 Диагностический alt-проход (render/capture → их 48 кГц альты и обратно в
 alt 0) остановился на первом шаге: SelRenderStatus = 0xC000000D. Кандидат
 с лучшей аргументацией — одиночный entry без {NULL,NULL}-терминатора в
 USBD_SelectInterfaceUrbAllocateAndBuild; правка — терминатор, проверка —
 после следующей перезагрузки (образ живёт до неё).
 
-### M3-A, фикс терминатора установлен (2026-11-05, 2.0.0.21): вердикт после перезагрузки
+### Поправка M3-A: «SelectConfiguration успешен» был ложноположительным;
+корень 0xC000000D найден и исправлен (2026-11-05, 2.0.0.22)
 
-Правка из кандидата превращена в пакет: `EmuUsbSelectInterface` передаёт
-массив из двух `USBD_INTERFACE_LIST_ENTRY` — интерфейс плюс `{NULL,NULL}`-
-терминатор (комментарий на месте объясняет, почему одиночная форма была
-отказана железом). EntryBread поднят до **0x16** (в реестре десятичное 22 —
-критерий свежего образа). Проверено без железа: `kbuild.sh` — BUILT,
-`utest.sh` — 4 из 4 (652 проверки), `kinstall.ps1` — пакет добавлен,
-devnode на DEVPKEY_Device_DriverVersion = 2.0.0.21, сервис RUNNING,
-Verifier выключен (breadcrumb-канал свободен). **Не проверено: сам
-терминатор на шине** — после перезагрузки смотреть по порядку:
-`EntryBread = 22`, `SelConfigStatus = 0`, затем `SelRenderStatus`,
-`SelCaptureStatus` и финальный idle-статус (все 0 = семантика
-select-interface доказана целиком), после этого `emu-probe` — PASS. Если
-SelRenderStatus снова не ноль — терминатор был не единственной причиной
-0xC000000D, и следующая проверка по трейсу живого старта (канал так и не
-настроен — см. подводный камень ниже).
+**Прогон 0x16 опроверг гипотезу терминатора**: EntryBread=22, SelConfigStatus=0,
+SelRenderStatus=0xC000000D снова, SelCapture/SelIdle отсутствуют. Двумя
+обходами корень найден без единого ребута:
+
+1. **Офлайн-проба** (`_analysis/seliface_probe.cpp` на реальной фикстуре 0404):
+   все 32 альта из парсера находимы `EmuCapsFindInterfaceDescriptor`
+   (render 48 кГц = интерфейс 1/alt 3, дескриптор @329, 2 endpoint'а;
+   capture = 2/alt 3, 1 endpoint). Наша нога поиска чиста — статус приходит
+   от USBD.
+2. **Дизассемблирование usbdex.lib** (WDK 10.0.26100.0, `dumpbin /disasm`):
+   публичный `USBD_SelectInterfaceUrbAllocateAndBuild` — не тонкая обёртка.
+   В первом блоке — не-NULL проверки аргументов, одна из них
+   **«ConfigurationHandle cant be NULL» → 0xC000000D** (прочие возвраты:
+   Urb NULL, PendingDelete/ReferenceCount хэндла → 0xC0000184, нет памяти →
+   0xC000009A, bNumEndpoints > 32 → «Too Many Pipes»; на нас не похожи).
+   Найдено после того, как ручное декодирование байтов показало единственный
+   суpect-чек «Too Many Pipes», а точный дизасм с мнемониками — нет.
+
+**Корень — билд без сабмита.** ConfigurationHandle присваивает USB-стек
+**при сабмите** select-config URB; билдер его не заполняет.
+`EmuUsbSelectConfiguration` строил URB, читал
+`UrbSelectConfiguration.ConfigurationHandle` из несабмиченного URB — получал
+NULL — и писал его в `Ctx->ConfigHandle`. Отсюда ложный вердикт M3-A:
+SelConfigStatus=0 доказывал только билдер. Дальше
+`USBD_SelectInterfaceUrbAllocateAndBuild(UsbdHandle, NULL, …)` падал на
+первом NULL-чеке, не дойдя ни до бNumEndpoints, ни до колбэка
+`handle->0x90`, который решает исход при валидных аргументах. Терминатор
+был правильным, но не причиной. Замечание: и с валидным хэндлом билд без
+сабмита ничего бы не сделал — SET_INTERFACE happens exactly at submit;
+пайп-хэндлы фазы B тоже появляются только там.
+
+**Фикс (2.0.0.22, EntryBread 0x17 = 23):** оба select'а сабмитятся через
+уже доказанный `EmuUsbSubmitUrb`: select-config — после билда, с проверкой,
+что стек вернул не-NULL хэндл (иначе — честный
+`STATUS_DEVICE_CONFIGURATION_ERROR` на месте, а не дальний 0xC000000D);
+select-interface — после билда, при отказе сабмита новый URB освобождается,
+прежний альт и сохранённый URB нетронуты. Комментарии обоих функций
+объясняют семантику build ≠ submit.
+
+Проверено без железа: `kbuild.sh` — BUILT, `utest.sh` — 4 из 4,
+`kinstall.ps1` — пакет добавлен, devnode на 2.0.0.22, сервис RUNNING,
+Verifier выключен. **После перезагрузки смотреть по порядку:**
+`EntryBread = 23`, `SelConfigStatus = 0` (теперь это реальный сабмит:
+SET_CONFIGURATION(1) — no-op для уже активной конфигурации),
+`SelRenderStatus`, `SelCaptureStatus`, `SelIdleStatus` — все 0 = семантика
+select-interface доказана на шине, первая половина M3-гейта закрыта
+настоящий раз. При отказе статусы теперь честно различают build и submit.
 
 Инфраструктурный закон цикла разработки, оформленный окончательно:
 **kernel-образ драйвера выгружается только загрузкой ОС** —

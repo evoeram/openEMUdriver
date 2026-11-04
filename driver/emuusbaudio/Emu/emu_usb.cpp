@@ -628,8 +628,9 @@ Exit:
 // all at alternate setting 0 (idle). The entries point into our own
 // configuration descriptor copy, which stays alive for the whole start; the
 // interface information USBD fills in lives inside the select-config URB,
-// which stays alive too. This answers the plan's long-standing question about
-// USBD_INTERFACE_LIST_ENTRY semantics on hardware.
+// which stays alive too. The URB is submitted here: a build-only pass left
+// the configuration handle NULL (only the stack assigns it, during submit)
+// and made the M3-A "SelectConfiguration succeeded" verdict a false positive.
 #pragma code_seg("PAGE")
 NTSTATUS
 EmuUsbSelectConfiguration(
@@ -678,22 +679,45 @@ EmuUsbSelectConfiguration(
                                                   &Ctx->SelectConfigUrb);
     ExFreePoolWithTag(list, EMU_POOLTAG);
     if (!NT_SUCCESS(status)) {
-        EMU_LOG_ERROR(STR_MODULENAME "select configuration failed, 0x%x\n",
-                      status);
+        EMU_LOG_ERROR(STR_MODULENAME "select configuration build failed, "
+                      "0x%x\n", status);
         EmuNoteStatusValue(Ctx, L"SelConfigStatus", (ULONG)status);
         return status;
     }
 
-    // The configuration handle every select-interface URB needs lives in the
-    // response, together with the alt-0 interface information.
+    // The built URB is not the selection: the SET_CONFIGURATION runs, and the
+    // configuration handle is assigned, during submission. An unsubmitted
+    // build left ConfigHandle NULL, which the select-interface wrapper then
+    // refused with STATUS_INVALID_PARAMETER - the M3-A 0xC000000D.
+    status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, Ctx->SelectConfigUrb);
+    if (!NT_SUCCESS(status)) {
+        EMU_LOG_ERROR(STR_MODULENAME "select configuration submit failed, "
+                      "0x%x\n", status);
+        EmuNoteStatusValue(Ctx, L"SelConfigStatus", (ULONG)status);
+        return status;
+    }
+
+    // The configuration handle every select-interface URB needs, together
+    // with the alt-0 interface information, exists only after the submit.
     Ctx->ConfigHandle = Ctx->SelectConfigUrb->UrbSelectConfiguration.ConfigurationHandle;
+    if (Ctx->ConfigHandle == NULL) {
+        // A successful submit without a handle breaks the stack contract;
+        // refuse here rather than let select-interface's NULL check be the
+        // first place the break is noticed.
+        EMU_LOG_ERROR(STR_MODULENAME "select configuration returned no "
+                      "handle\n");
+        EmuNoteStatusValue(Ctx, L"SelConfigStatus",
+                           (ULONG)STATUS_DEVICE_CONFIGURATION_ERROR);
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
     EmuNoteStatusValue(Ctx, L"SelConfigStatus", (ULONG)status);
     return status;
 }
 
-// Move one direction to a streaming alternate (alt 0 returns it to idle).
-// The select-interface URB is kept in the direction's slot - the interface
-// information, with the pipe handles phase B needs, lives inside it. A
+// Move one direction to a streaming alternate (alt 0 returns it to idle):
+// build the select-interface URB and submit it, so the SET_INTERFACE runs
+// and the pipe handles phase B needs become real. The submitted URB stays in
+// the direction's slot - the interface information lives inside it. A
 // re-selection frees the previous URB first, which is safe while nothing
 // streams from its pipes.
 #pragma code_seg("PAGE")
@@ -736,8 +760,20 @@ EmuUsbSelectInterface(
                                                      entry,
                                                      &urb);
     if (!NT_SUCCESS(status)) {
-        EMU_LOG_ERROR(STR_MODULENAME "select interface %lu alt %lu failed, "
-                      "0x%x\n", InterfaceNumber, AltSetting, status);
+        EMU_LOG_ERROR(STR_MODULENAME "select interface %lu alt %lu build "
+                      "failed, 0x%x\n", InterfaceNumber, AltSetting, status);
+        return status;
+    }
+
+    // The built URB is not the selection: the SET_INTERFACE runs, and the
+    // pipe handles become real, during submission. A failed submit leaves
+    // the previous alternate in place - the new URB is dropped, the stored
+    // one untouched.
+    status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, urb);
+    if (!NT_SUCCESS(status)) {
+        EMU_LOG_ERROR(STR_MODULENAME "select interface %lu alt %lu submit "
+                      "failed, 0x%x\n", InterfaceNumber, AltSetting, status);
+        USBD_UrbFree(Ctx->UsbdHandle, urb);
         return status;
     }
 
