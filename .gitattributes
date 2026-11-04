@@ -1,0 +1,23 @@
+# core.autocrlf=true on a Windows checkout would turn the build scripts into
+# CRLF, and bash then fails on the stray \r — pin the endings instead so a
+# fresh clone builds by the instructions in docs/BUILD.md.
+*.sh   text eol=lf
+*.bash text eol=lf
+
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.inf  text eol=crlf
+*.inx  text eol=crlf
+
+*.cpp  text
+*.h    text
+*.md   text
+
+# never line-convert binaries
+*.exe  binary
+*.asio binary
+*.sys  binary
+*.cat  binary
+*.lib  binary
+*.obj  binary
+*.pdb  binary

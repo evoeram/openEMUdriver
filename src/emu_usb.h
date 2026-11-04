@@ -79,6 +79,12 @@ public:
     const struct StreamFormat* formats(int direction) const; // direction 0=out 1=in
     int formatCount(int direction) const;
 
+    // Raw USB configuration descriptor as read at open(). Feeds emu-dump's
+    // saved dumps, which are the fixtures for the kernel-side parser (M2).
+    const uint8_t* rawConfig() const { return m_cfg; }
+    uint16_t rawConfigLength() const { return m_cfgLen; }
+    uint8_t acInterface() const { return m_acIface; }
+
     // ---- XU control (class requests on AudioControl interface) ----
     bool xuGet(uint8_t unitID, uint8_t cs, void* buf, uint16_t len);
     bool xuSet(uint8_t unitID, uint8_t cs, const void* buf, uint16_t len);

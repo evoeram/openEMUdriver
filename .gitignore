@@ -1,10 +1,12 @@
-build/*.o
-build/*.obj
+# build output
+build/
 *.o
 *.obj
-*.o
-*.obj
-*.sys
+*.ilk
 *.pdb
-*.lib
 *.exp
+*.lib
+*.sys
+
+# on-demand reference trees (tools/get-ref.sh)
+ref/

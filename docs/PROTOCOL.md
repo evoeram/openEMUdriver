@@ -1,8 +1,8 @@
 # E-MU USB (CA0189) — протокол управления
 
 Источники:
-1. **Официальный открытый драйвер E-MU «CA0189 USB Audio Driver» для macOS** — выпущен E-MU Systems/Creative Technology Ltd в 2008 под **LGPLv2.1+** (копия: `ref/EMU-driver/src/EMUUSBAudio`). Это первоисточник wire-протокола.
-2. Дизасемблирование Windows-драйвера 1.30.07 (`emusba10.sys`, `emasio.dll`, `EmuUsbAudioCP.exe`) — перекрёстная проверка.
+1. **Официальный открытый драйвер E-MU «CA0189 USB Audio Driver» для macOS** — выпущен E-MU Systems/Creative Technology Ltd в 2008 под **LGPLv2.1+** (локальная копия кладётся в `ref/EMU-driver/src/EMUUSBAudio`, в git не входит — `tools/get-ref.sh emu-driver`). Это первоисточник wire-протокола.
+2. Дизасемблирование Windows-драйвера 1.30.07 (`emusba10.sys`, `emasio.dll`, `EmuUsbAudioCP.exe`) — перекрёстная проверка. Каждый селектор и формат запроса из таблицы ниже подтверждён этим путём независимо, поэтому документ пригоден и без локальной копии исходника.
 
 ## Устройства
 

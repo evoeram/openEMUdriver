@@ -74,16 +74,22 @@ DAW ──IASIO──► openEMUdriver.asio ──WinUSB iso (1 мс/пакет,
 
 - Windows-аудио (WASAPI) на устройстве отсутствует — устройство отдаётся ASIO
   монопольно (как и у оригинального драйвера).
-- Сборка без подписи: INF ставится локально (свойself-signed сертификат +
-  Inf2Cat + signtool, сценарий в inf/); для дистрибутива — attestation-подпись.
+- Сборка без подписи: INF ставится локально (self-signed сертификат + Inf2Cat +
+  signtool, сценарий в inf/); для дистрибутива — attestation-подпись.
 
 ## Сборка
 
 ```bash
-MINGW=/c/dev/tools/mingw64/mingw64/bin ./build.sh
+./build.sh          # v1: ASIO DLL, панель, инструменты (MinGW-w64)
+cd driver && ./kbuild.sh emuusbaudio/build/smoke.sys emuusbaudio/smoke.c   # v2: ядро (MSVC + WDK)
 ```
 
-Нужен только MinGW-w64 (GCC) — Windows SDK не требуется (winusb.h входит в MinGW).
+Компиляторы ищутся сами (переменные окружения — только для переопределения).
+Полная инструкция для чистой машины, включая установку тулчейна и подпись:
+**[docs/BUILD.md](file:///C:/dev/openEMUdriver/docs/BUILD.md)**.
+
+Для v1 нужен только MinGW-w64 (GCC) — Windows SDK не требуется (winusb.h входит
+в MinGW).
 
 ## Удаление
 
