@@ -912,12 +912,23 @@ select-interface — после билда, при отказе сабмита �
 
 Проверено без железа: `kbuild.sh` — BUILT, `utest.sh` — 4 из 4,
 `kinstall.ps1` — пакет добавлен, devnode на 2.0.0.22, сервис RUNNING,
-Verifier выключен. **После перезагрузки смотреть по порядку:**
-`EntryBread = 23`, `SelConfigStatus = 0` (теперь это реальный сабмит:
-SET_CONFIGURATION(1) — no-op для уже активной конфигурации),
-`SelRenderStatus`, `SelCaptureStatus`, `SelIdleStatus` — все 0 = семантика
-select-interface доказана на шине, первая половина M3-гейта закрыта
-настоящий раз. При отказе статусы теперь честно различают build и submit.
+Verifier выключен.
+
+**Железный вердикт 2.0.0.22 (2026-11-05, EntryBread=23): гейт закрыт.**
+Все пять breadcrumb'ов нулевые: `SelConfigStatus = 0` (реальный сабмит,
+SET_CONFIGURATION на шину), `SelRenderStatus = 0` (render → 48 кГц
+alt 3), `SelCaptureStatus = 0` (capture → alt 3), `SelIdleStatus = 0`
+(оба обратно в alt 0). Семантика select-interface доказана на живой
+0404 целиком: билд **и** сабмит, SET_INTERFACE меняет альты устройства
+и возвращает их в zero-bandwidth. После прогона `emu-probe` — PASS
+(GET_CAPS — полная таблица живого дескриптора: 16+16 альтов, 4 канала,
+6 дискретных частот, юниты 0x0C-0x0F; GET_STATE — все контролы unknown,
+pnp started, start 1/stop 0/remove 0): контрольное устройство и IOCTL-контракт
+живы после нового пути выбора. Урок прогона, записанный в код:
+**построенный URB — не выполненная операция**; статус билдера без
+сабмита ничего не говорит о шине. Следующий шаг — M3-B: iso-URB-кольцо
+на пайпах, чьи хэндлы теперь настоящие (внутри сохранённых
+select-interface URB'ов), test-only IOCTL 48 kHz stereo render/capture.
 
 Инфраструктурный закон цикла разработки, оформленный окончательно:
 **kernel-образ драйвера выгружается только загрузкой ОС** —
