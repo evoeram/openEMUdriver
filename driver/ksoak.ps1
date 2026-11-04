@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   ksoak.ps1 [-Cycles 50] [-RemoveCycles 10] [-Verifier] [-VerifierOff] [-Quiet]
 
@@ -40,7 +40,7 @@ function Test-Admin {
 
 function Get-EmuDevnode {
     Get-PnpDevice -PresentOnly | Where-Object {
-        $_.InstanceId -like 'USB\VID_041E&PID_3F04' } | Select-Object -First 1
+        $_.InstanceId -like 'USB\VID_041E&PID_3F04*' } | Select-Object -First 1
 }
 
 # WMI counter names are English on every locale, unlike Get-Counter paths.
