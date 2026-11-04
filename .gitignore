@@ -2,3 +2,9 @@ build/*.o
 build/*.obj
 *.o
 *.obj
+*.o
+*.obj
+*.sys
+*.pdb
+*.lib
+*.exp

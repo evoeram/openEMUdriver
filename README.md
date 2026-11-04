@@ -51,7 +51,13 @@ DAW ──IASIO──► openEMUdriver.asio ──WinUSB iso (1 мс/пакет,
 Настройки (опционально), `HKLM\SOFTWARE\ASIO\openEMUdriver` (REG_DWORD):
 `PreferredBufferSize` (фреймы, 64–4096), `QueueMs` (глубина USB-очереди, 2–16).
 
-## Статус (протестировано на реальной 0404 USB, прошивка 8.04)
+## v2 — kernel-драйвер (WASAPI + ASIO одновременно)
+
+В работе (см. docs/V2_PLAN.md): EmuUSBAudio.sys на PortCLS — WASAPI-endpoint'ы
+через KS, наш ASIO через DirectKS. Тулчейн ядра готов и проверен
+(MSVC + WDK, smoke-драйвер собирается и подписывается).
+
+## Статус v1 (протестировано на реальной 0404 USB, прошивка 8.04)
 
 - ✅ Поток 44.1 / 48 / 96 / **192 кГц**, 2 и 4 канала, 24 бит — точная ASIO-каденция
   (256-фреймовый буфер: 5.333 мс @48k и т.д.), 0 ошибок трансферов.
