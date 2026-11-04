@@ -705,7 +705,12 @@ EmuUsbSelectInterface(
     _In_ ULONG                  AltSetting
     )
 {
-    USBD_INTERFACE_LIST_ENTRY entry;
+    // Two entries: the interface being selected plus the {NULL, NULL}
+    // terminator the USBD list walker requires even for a single
+    // interface (the single-entry form was refused with
+    // STATUS_INVALID_PARAMETER on hardware). Both live on the stack for
+    // the duration of the call.
+    USBD_INTERFACE_LIST_ENTRY entry[2];
     PURB urb = NULL;
     NTSTATUS status;
 
@@ -720,13 +725,15 @@ EmuUsbSelectInterface(
     if (off < 0) {
         return STATUS_INVALID_PARAMETER;
     }
-    entry.InterfaceDescriptor =
+    entry[0].InterfaceDescriptor =
         (PUSB_INTERFACE_DESCRIPTOR)&((PUCHAR)Ctx->ConfigDescriptor)[off];
-    entry.Interface = NULL;
+    entry[0].Interface = NULL;
+    entry[1].InterfaceDescriptor = NULL;
+    entry[1].Interface = NULL;
 
     status = USBD_SelectInterfaceUrbAllocateAndBuild(Ctx->UsbdHandle,
                                                      Ctx->ConfigHandle,
-                                                     &entry,
+                                                     entry,
                                                      &urb);
     if (!NT_SUCCESS(status)) {
         EMU_LOG_ERROR(STR_MODULENAME "select interface %lu alt %lu failed, "
