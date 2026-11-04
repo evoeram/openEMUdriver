@@ -158,7 +158,7 @@ if ($Build) {
             emuusbaudio/Emu/emu_disp.cpp `
             emuusbaudio/Emu/emu_usb.cpp emuusbaudio/Emu/emu_desc.cpp `
             emuusbaudio/Emu/emu_ctrl.cpp emuusbaudio/Emu/emu_state.cpp `
-            emuusbaudio/Emu/emu_ioctl.cpp
+            emuusbaudio/Emu/emu_ioctl.cpp emuusbaudio/Emu/emu_isoch.cpp
         if ($LASTEXITCODE -ne 0) { throw "kbuild.sh failed" }
     } finally { Pop-Location }
 }

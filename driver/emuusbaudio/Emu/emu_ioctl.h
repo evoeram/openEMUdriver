@@ -69,6 +69,20 @@ DEFINE_GUID(GUID_DEVINTERFACE_EMUUSBAUDIO,
 #define EMU_IOCTL_SET_SOFT_LIMIT    CTL_CODE(EMU_IOCTL_BASE, 0x805, METHOD_BUFFERED, \
                                              FILE_WRITE_ACCESS)
 
+// M3 stage B, TEST-ONLY: the kernel iso slice answers three diagnostic codes
+// that arm and read back a 48 kHz stereo render/capture pair. They are a
+// measuring instrument, not a contract surface: the panel never learns of
+// them (no EMU_OP_ bit, no SupportedMask entry), emu-probe is their only
+// client, and the M3 acceptance criterion has them removed from the release
+// build. Kept here — not in a separate header — so the same layout rules
+// (ULONG-only, Size/Version first) are checked once.
+#define EMU_IOCTL_TEST_STREAM_START CTL_CODE(EMU_IOCTL_BASE, 0x806, METHOD_BUFFERED, \
+                                             FILE_WRITE_ACCESS)
+#define EMU_IOCTL_TEST_STREAM_STOP  CTL_CODE(EMU_IOCTL_BASE, 0x807, METHOD_BUFFERED, \
+                                             FILE_WRITE_ACCESS)
+#define EMU_IOCTL_TEST_STREAM_STATS CTL_CODE(EMU_IOCTL_BASE, 0x808, METHOD_BUFFERED, \
+                                             FILE_READ_ACCESS)
+
 // The SET input stage: the value only, never a unit id, control selector or
 // length — those stay the driver's business. Size/Version first, like every
 // structure here, so a panel built against a newer driver is still readable.
@@ -172,6 +186,39 @@ typedef struct _EMU_STATE_INFO {
     ULONG RemoveCount;
 } EMU_STATE_INFO, *PEMU_STATE_INFO;
 
+// The test-stream reply (M3 stage B, test-only). One entry per direction,
+// [0] = render, [1] = capture. The pipe facts are read out of the submitted
+// select-interface URB once at start; the counters are interlocked engine
+// state, not a locked snapshot — a stats read during streaming is honest but
+// momentarily inconsistent, which is fine for a measuring instrument.
+typedef struct _EMU_TEST_STREAM_DIR_STATS {
+    ULONG Running;                 // nonzero while the worker thread lives
+    ULONG InterfaceNumber;         // as selected, EMU_NO_VALUE when idle
+    ULONG AltSetting;              // as selected, EMU_NO_VALUE when idle
+    ULONG MaxPacketSize;           // pipe fact, 0 when idle
+    ULONG PipeInterval;            // raw USBD_PIPE_INFORMATION.Interval
+    ULONG PeriodMs;                // derived packet period
+    ULONG NominalFrames;           // frames per packet at the armed rate
+    ULONG Submits;                 // URB submissions since start
+    ULONG Completes;               // completions harvested
+    ULONG UrbFailures;             // IRP or URB header status failures
+    ULONG IsoPacketErrors;         // per-packet USBD status failures
+    ULONG ShortPackets;            // transferred below the nominal packet
+    ULONG Bytes;                   // audio bytes transferred
+    ULONG LastUrbStatus;
+    ULONG LastPacketStatus;
+} EMU_TEST_STREAM_DIR_STATS, *PEMU_TEST_STREAM_DIR_STATS;
+
+typedef struct _EMU_TEST_STREAM_STATS {
+    ULONG Size;                    // sizeof(EMU_TEST_STREAM_STATS)
+    ULONG Version;                 // EMU_IOCTL_VERSION
+    ULONG RateHz;                  // the rate the streams were armed at
+    EMU_TEST_STREAM_DIR_STATS Dir[2];
+} EMU_TEST_STREAM_STATS, *PEMU_TEST_STREAM_STATS;
+
+C_ASSERT(sizeof(EMU_TEST_STREAM_STATS) == 3 * sizeof(ULONG) +
+         2 * 15 * sizeof(ULONG));
+
 // --- what the driver makes of a request -------------------------------------
 
 typedef struct _EMU_IOCTL_CALL {
@@ -190,6 +237,9 @@ typedef enum _EMU_IOCTL_ACTION {
     EmuIoctlSetClockSource,
     EmuIoctlSetSpdifFormat,
     EmuIoctlSetSoftLimit,
+    EmuIoctlTestStart,   // M3 test slice, not a panel operation
+    EmuIoctlTestStop,
+    EmuIoctlTestStats,
     EmuIoctlReject       // ours, but refused; Status says why
 } EMU_IOCTL_ACTION;
 

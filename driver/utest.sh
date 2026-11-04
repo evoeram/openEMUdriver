@@ -39,11 +39,11 @@ err() { echo "utest: $*" >&2; exit 1; }
 for a in "$@"; do
     case "$a" in
         -n) RUN=0 ;;
-        desc|ctrl|state|ioctl) WANT="$WANT $a" ;;
+        desc|ctrl|state|ioctl|isoch) WANT="$WANT $a" ;;
         *) err "unknown argument: $a" ;;
     esac
 done
-[ -n "$WANT" ] || WANT="desc ctrl state ioctl"
+[ -n "$WANT" ] || WANT="desc ctrl state ioctl isoch"
 
 . "$SCRIPT_DIR/toolfound.sh"
 
@@ -58,6 +58,7 @@ src_for() {
         ctrl)  echo "$DRV/Emu/emu_ctrl.cpp" ;;
         state) echo "$DRV/Emu/emu_state.cpp $DRV/Emu/emu_desc.cpp" ;;
         ioctl) echo "$DRV/Emu/emu_ioctl.cpp $DRV/Emu/emu_desc.cpp $DRV/Emu/emu_state.cpp" ;;
+        isoch) echo "$DRV/Emu/emu_isoch.cpp" ;;
     esac
 }
 test_for() { echo "$SCRIPT_DIR/tests/emu_$1test.cpp"; }

@@ -84,7 +84,7 @@ cd driver
 самодостаточно: `emu.h` виден из любого TU, линкуется без сэмпловой обвязки и
 без KMDF — `dumpbin /imports` даёт только `ntoskrnl.exe` и `portcls.sys`,
 включая сборку M2 целиком (`emu_usb.cpp`, `emu_desc.cpp`, `emu_ctrl.cpp`,
-`emu_state.cpp`, `emu_ioctl.cpp`, `emu_disp.cpp`): `usbdex.lib` статический,
+`emu_state.cpp`, `emu_ioctl.cpp`, `emu_disp.cpp`, `emu_isoch.cpp`): `usbdex.lib` статический,
 поэтому `USBD.SYS` в импортах не появляется. GUID класса контрольного
 устройства определяется ровно в одном TU — `emu_driver.cpp` первым включает
 `<initguid.h>`, так что `DEFINE_GUID` из `Emu/emu_ioctl.h` разворачивается там
@@ -158,12 +158,13 @@ user-mode через `<windows.h>`/`<ntstatus.h>` (см. `Emu/emu_desc.h`).
   `PcDispatchIrp` нетронутым.
 
 ```bash
-cd driver && ./utest.sh             # все четыре модуля: собрать и запустить
+cd driver && ./utest.sh             # все пять модулей: собрать и запустить
 cd driver && ./utest.sh -n          # только собрать, не запускать
 cd driver && ./utest.sh desc        # только парсер
 cd driver && ./utest.sh ctrl        # только EP0-запросы
 cd driver && ./utest.sh state       # только кэш состояния
 cd driver && ./utest.sh ioctl       # только контракт панели
+cd driver && ./utest.sh isoch       # только математика iso-планировщика
 ```
 
 `utest.sh` для каждого модуля делает два шага, и оба должны проходить:

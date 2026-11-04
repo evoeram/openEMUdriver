@@ -111,6 +111,82 @@ static void PrintState(const EMU_STATE_INFO* s)
            s->StartCount, s->StopCount, s->RemoveCount);
 }
 
+// The M3 test-slice reply. "Short" counts both sub-nominal IN packets (the
+// device's implicit-feedback jitter) and any OUT packet the bus transferred
+// below the nominal size; at 48 kHz on a healthy stream both should stay at
+// zero, and every error counter with them.
+static void PrintTestStats(const EMU_TEST_STREAM_STATS* t)
+{
+    static const char* names[2] = {"render", "capture"};
+
+    printf("EMU_TEST_STREAM_STATS: size %lu, version %lu\n", t->Size, t->Version);
+    printf("  rate            %lu Hz\n", t->RateHz);
+    for (ULONG d = 0; d < 2; d++) {
+        const EMU_TEST_STREAM_DIR_STATS* e = &t->Dir[d];
+        printf("  %-8s running %lu, iface %lu alt %lu, mps %lu interval %lu "
+               "period %lu ms, nominal %lu frames\n",
+               names[d], e->Running, e->InterfaceNumber, e->AltSetting,
+               e->MaxPacketSize, e->PipeInterval, e->PeriodMs, e->NominalFrames);
+        printf("           submits %lu, completes %lu, urb-fail %lu, "
+               "pkt-err %lu, short %lu, bytes %lu\n",
+               e->Submits, e->Completes, e->UrbFailures, e->IsoPacketErrors,
+               e->ShortPackets, e->Bytes);
+        printf("           last urb 0x%08X, last pkt 0x%08X\n",
+               e->LastUrbStatus, e->LastPacketStatus);
+    }
+}
+
+// One test-stream roundtrip: START (rate in the value stage) or STOP, the
+// stats reply out. Returns 0 only when the driver reports both directions
+// running (START) or both idle (STOP) - a half-armed start is a failure here,
+// the caller can then stop whatever did come up.
+static int DoTestStream(HANDLE h, ULONG code, ULONG rate, const char* name,
+                        int wantRunning)
+{
+    EMU_SET_INPUT in;
+    EMU_TEST_STREAM_STATS stats;
+    DWORD got;
+
+    in.Size = sizeof(in);
+    in.Version = EMU_IOCTL_VERSION;
+    in.Value = rate;
+    if (!DeviceIoControl(h, code, &in, sizeof(in),
+                         &stats, sizeof(stats), &got, NULL)) {
+        PrintWin32Error(name, GetLastError());
+        return 1;
+    }
+    if (got < sizeof(stats)) {
+        printf("%s returned %lu bytes, expected %lu\n", name,
+               (unsigned long)got, (unsigned long)sizeof(stats));
+        return 1;
+    }
+    PrintTestStats(&stats);
+    for (ULONG d = 0; d < 2; d++) {
+        if ((stats.Dir[d].Running != 0) != (wantRunning != 0)) {
+            printf("%s: %s direction %s, want %s\n", name,
+                   d == 0 ? "render" : "capture",
+                   stats.Dir[d].Running ? "running" : "idle",
+                   wantRunning ? "running" : "idle");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int DoTestStats(HANDLE h)
+{
+    EMU_TEST_STREAM_STATS stats;
+    DWORD got;
+
+    if (!DeviceIoControl(h, EMU_IOCTL_TEST_STREAM_STATS, NULL, 0,
+                         &stats, sizeof(stats), &got, NULL)) {
+        PrintWin32Error("TEST_STREAM_STATS", GetLastError());
+        return 1;
+    }
+    PrintTestStats(&stats);
+    return 0;
+}
+
 static void PrintWin32Error(const char* what, DWORD err)
 {
     LPSTR msg = NULL;
@@ -217,6 +293,14 @@ int main(int argc, char** argv)
         } else if (!strcmp(argv[1], "set-softlimit")) {
             r = DoSet(h, EMU_IOCTL_SET_SOFT_LIMIT, value, "SET_SOFT_LIMIT",
                       offsetof(EMU_STATE_INFO, SoftLimit));
+        } else if (!strcmp(argv[1], "test-start")) {
+            r = DoTestStream(h, EMU_IOCTL_TEST_STREAM_START,
+                             value ? value : 48000, "TEST_STREAM_START", 1);
+        } else if (!strcmp(argv[1], "test-stop")) {
+            r = DoTestStream(h, EMU_IOCTL_TEST_STREAM_STOP, 0,
+                             "TEST_STREAM_STOP", 0);
+        } else if (!strcmp(argv[1], "test-stats")) {
+            r = DoTestStats(h);
         } else {
             printf("unknown subcommand %s; reading state only\n", argv[1]);
             r = -1;

@@ -40,7 +40,7 @@ EmuUsbUrbCompletion(
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
-static NTSTATUS
+NTSTATUS
 EmuUsbSubmitUrb(
     _In_ PDEVICE_OBJECT Target,
     _In_ USBD_HANDLE    Handle,
@@ -846,6 +846,13 @@ EmuUsbRelease(
     )
 {
     PAGED_CODE();
+
+    // The test streams die first: their worker threads and queued iso URBs
+    // reference the pipe handles the select-interface URBs below carry, and
+    // the stop path drains both before anything here is freed. No bus
+    // operation is attempted from here - on the release path the device may
+    // already be gone, and the abort failing is the normal case there.
+    EmuIsochStopAll(Ctx);
 
     // Every field is cleared as it goes, so a second call after a partial
     // initialize can never double-free.

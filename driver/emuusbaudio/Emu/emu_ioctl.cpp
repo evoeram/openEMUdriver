@@ -41,6 +41,17 @@ EmuIoctlClassify(
     } else if (Call->ControlCode == EMU_IOCTL_SET_SOFT_LIMIT) {
         action = EmuIoctlSetSoftLimit;
         required = sizeof(EMU_SET_INPUT);
+    } else if (Call->ControlCode == EMU_IOCTL_TEST_STREAM_START ||
+               Call->ControlCode == EMU_IOCTL_TEST_STREAM_STOP) {
+        // M3 test slice: same input stage as a SET (Size/Version/Value, the
+        // value being the rate for START, ignored by STOP), the stats reply
+        // out. Not a panel operation - see the note in emu_ioctl.h.
+        action = Call->ControlCode == EMU_IOCTL_TEST_STREAM_START
+                     ? EmuIoctlTestStart : EmuIoctlTestStop;
+        required = sizeof(EMU_SET_INPUT);
+    } else if (Call->ControlCode == EMU_IOCTL_TEST_STREAM_STATS) {
+        action = EmuIoctlTestStats;
+        required = sizeof(EMU_TEST_STREAM_STATS);
     } else {
         // Everything else belongs to somebody else and goes back untouched.
         // That is not a courtesy: the FDO is PortCls's, and KS/wdmaud drive it
@@ -65,8 +76,11 @@ EmuIoctlClassify(
     // The queries are buffered with no input stage at all: an input buffer
     // means the caller believes it is sending something this build does not
     // define, so it is refused instead of silently ignored - the same argument
-    // that keeps unimplemented opcodes out of the header.
-    if (action == EmuIoctlGetCaps || action == EmuIoctlGetState) {
+    // that keeps unimplemented opcodes out of the header. TEST_STREAM_STATS
+    // reads the same way: the counters are the reply, there is no request to
+    // make of them.
+    if (action == EmuIoctlGetCaps || action == EmuIoctlGetState ||
+        action == EmuIoctlTestStats) {
         if (Call->InputBufferLength != 0) {
             Decision->Action = EmuIoctlReject;
             Decision->Status = STATUS_INVALID_PARAMETER;
@@ -88,13 +102,19 @@ EmuIoctlClassify(
     // fields (a newer panel may append), a larger output is fine unread - the
     // same append-only compatibility the queries offer. The reply carries the
     // state so the panel sees the accepted value and LastOperationStatus in
-    // one roundtrip instead of guessing and re-reading.
+    // one roundtrip instead of guessing and re-reading. The test stream's
+    // START and STOP take the same input stage and answer with the test
+    // stats instead - a measuring instrument reports what it measured.
+    ULONG outRequired = sizeof(EMU_STATE_INFO);
+    if (action == EmuIoctlTestStart || action == EmuIoctlTestStop) {
+        outRequired = sizeof(EMU_TEST_STREAM_STATS);
+    }
     if (Call->InputBufferLength < required) {
         Decision->Action = EmuIoctlReject;
         Decision->Status = STATUS_INVALID_PARAMETER;
         return;
     }
-    if (Call->OutputBufferLength < sizeof(EMU_STATE_INFO)) {
+    if (Call->OutputBufferLength < outRequired) {
         Decision->Action = EmuIoctlReject;
         Decision->Status = STATUS_BUFFER_TOO_SMALL;
         return;
@@ -102,7 +122,7 @@ EmuIoctlClassify(
 
     Decision->Action = action;
     Decision->Status = STATUS_SUCCESS;
-    Decision->OutputBytes = sizeof(EMU_STATE_INFO);
+    Decision->OutputBytes = outRequired;
 }
 
 BOOLEAN

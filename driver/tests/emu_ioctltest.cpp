@@ -200,6 +200,67 @@ static void CaseSetRules(void)
     CheckStatus("state-input", STATUS_INVALID_PARAMETER, d.Status);
 }
 
+// The M3 test-slice codes: START and STOP take the SET input stage and answer
+// the test stats; STATS is a query. Not panel operations - no EMU_OP_ bit,
+// no SupportedMask entry - but the buffer rules are contract-grade all the
+// same, because emu-probe is only the first client of the layout.
+static void CaseTestStreamRules(void)
+{
+    g_case = "test-stream";
+    EMU_IOCTL_DECISION d;
+
+    // START with the exact stage and the stats reply.
+    Decide(&d, EMU_IOCTL_TEST_STREAM_START, TRUE, sizeof(EMU_SET_INPUT),
+           sizeof(EMU_TEST_STREAM_STATS));
+    CHECK_EQ(d.Action, EmuIoctlTestStart);
+    CheckStatus("test-start-exact", STATUS_SUCCESS, d.Status);
+    CHECK_EQ(d.OutputBytes, sizeof(EMU_TEST_STREAM_STATS));
+
+    // STOP takes the same stage; its value is ignored by the contract.
+    Decide(&d, EMU_IOCTL_TEST_STREAM_STOP, TRUE, sizeof(EMU_SET_INPUT),
+           sizeof(EMU_TEST_STREAM_STATS));
+    CHECK_EQ(d.Action, EmuIoctlTestStop);
+    CHECK_EQ(d.OutputBytes, sizeof(EMU_TEST_STREAM_STATS));
+
+    // A short input stage cannot carry Size/Version - refused before the
+    // engine is touched, exactly like a SET.
+    Decide(&d, EMU_IOCTL_TEST_STREAM_START, TRUE, sizeof(EMU_SET_INPUT) - 1,
+           sizeof(EMU_TEST_STREAM_STATS));
+    CheckStatus("test-start-short-input", STATUS_INVALID_PARAMETER, d.Status);
+
+    // The stats reply is the only answer these codes give - without room for
+    // it there is nothing to say.
+    Decide(&d, EMU_IOCTL_TEST_STREAM_START, TRUE, sizeof(EMU_SET_INPUT),
+           sizeof(EMU_TEST_STREAM_STATS) - 1);
+    CheckStatus("test-start-short-output", STATUS_BUFFER_TOO_SMALL, d.Status);
+    Decide(&d, EMU_IOCTL_TEST_STREAM_STOP, TRUE, sizeof(EMU_SET_INPUT), 0);
+    CheckStatus("test-stop-no-output", STATUS_BUFFER_TOO_SMALL, d.Status);
+
+    // STATS is a query: no input stage, stats-sized output, "not ready"
+    // outranks the buffers like every other code.
+    Decide(&d, EMU_IOCTL_TEST_STREAM_STATS, TRUE, 0,
+           sizeof(EMU_TEST_STREAM_STATS));
+    CHECK_EQ(d.Action, EmuIoctlTestStats);
+    CheckStatus("test-stats-exact", STATUS_SUCCESS, d.Status);
+    CHECK_EQ(d.OutputBytes, sizeof(EMU_TEST_STREAM_STATS));
+    Decide(&d, EMU_IOCTL_TEST_STREAM_STATS, TRUE, 4,
+           sizeof(EMU_TEST_STREAM_STATS));
+    CheckStatus("test-stats-with-input", STATUS_INVALID_PARAMETER, d.Status);
+    Decide(&d, EMU_IOCTL_TEST_STREAM_STATS, TRUE, 0,
+           sizeof(EMU_TEST_STREAM_STATS) - 1);
+    CheckStatus("test-stats-short-output", STATUS_BUFFER_TOO_SMALL, d.Status);
+    Decide(&d, EMU_IOCTL_TEST_STREAM_STATS, FALSE, 0,
+           sizeof(EMU_TEST_STREAM_STATS));
+    CHECK_EQ(d.Action, EmuIoctlReject);
+    CheckStatus("test-stats-not-ready", STATUS_DEVICE_NOT_READY, d.Status);
+
+    // The neighbouring function code stays foreign: 0x809 forward, the way
+    // 0x802 with query access bits was already pinned.
+    Decide(&d, CTL_CODE(EMU_IOCTL_BASE, 0x809, METHOD_BUFFERED, FILE_READ_ACCESS),
+           TRUE, 0, sizeof(EMU_TEST_STREAM_STATS));
+    CHECK_EQ(d.Action, EmuIoctlForward);
+}
+
 static void CaseCapsFill0404(void)
 {
     g_case = "caps-fill-0404";
@@ -478,6 +539,7 @@ main(void)
     CaseNotReady();
     CaseBufferRules();
     CaseSetRules();
+    CaseTestStreamRules();
     CaseUsable();
     CaseCapsFill0404();
     CaseCapsFillSparse();

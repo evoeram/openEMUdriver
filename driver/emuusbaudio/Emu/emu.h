@@ -21,6 +21,7 @@ extern "C" {
 #include "emu_ctrl.h"
 #include "emu_state.h"
 #include "emu_ioctl.h"
+#include "emu_isoch.h"
 
 #define STR_MODULENAME "EmuUSBAudio: "
 
@@ -155,6 +156,12 @@ typedef struct _EMU_DEVICE_CONTEXT {
         ULONG                     InterfaceNumber;
         ULONG                     AltSetting;
     }                             Stream[2];
+
+    // M3 stage B: the test-slice iso streams, one engine state per direction.
+    // Embedded rather than pointed: the whole state is bounded, nonpaged by
+    // usage and dies with the instance. EmuIsochStartStreams arms them, the
+    // test IOCTLs and EmuUsbRelease (via EmuIsochStopAll) retire them.
+    EMU_ISOCH_STREAM              Isoch[2];
 } EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
 // Stage 4c: the panel talks to a driver-owned control device object, not to
@@ -288,6 +295,16 @@ EmuUsbSendControl(
     _In_ PEMU_DEVICE_CONTEXT Context,
     _In_ const EMU_CTRL_REQUEST* Request,
     _Inout_opt_ PUCHAR Payload
+    );
+
+// Submit one built URB synchronously and return its status. The iso engine
+// (emu_isoch.cpp) uses it for the frame-number query and the pipe abort; the
+// engine's own packet submissions manage their IRPs directly.
+NTSTATUS
+EmuUsbSubmitUrb(
+    _In_ PDEVICE_OBJECT Target,
+    _In_ USBD_HANDLE    Handle,
+    _In_ PURB           Urb
     );
 
 #endif // _EMU_USB_AUDIO_H_

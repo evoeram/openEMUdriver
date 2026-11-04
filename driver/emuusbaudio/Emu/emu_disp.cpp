@@ -75,6 +75,59 @@ static NTSTATUS EmuCompleteQuery(
             Irp->IoStatus.Information = Decision->OutputBytes;
         }
         ExReleaseFastMutex(&Ctx->StateLock);
+    } else if (Decision->Action == EmuIoctlTestStart ||
+               Decision->Action == EmuIoctlTestStop ||
+               Decision->Action == EmuIoctlTestStats) {
+        // The M3 test slice. Unlike the panel SETs - which always complete
+        // SUCCESS and carry their verdict in the state payload - a failed
+        // start or stop completes with its real status: this is a measuring
+        // instrument, and its client is expected to fail loudly. The stats
+        // reply still travels (METHOD_BUFFERED returns Information bytes),
+        // so the failure comes with the counters that describe it.
+        EMU_IOCTL_ACTION action = Decision->Action;
+        NTSTATUS         op = STATUS_SUCCESS;
+        ULONG            rate = 0;
+
+        if (action != EmuIoctlTestStats) {
+            PEMU_SET_INPUT input = (PEMU_SET_INPUT)reply;
+
+            if (input->Size != sizeof(EMU_SET_INPUT) ||
+                input->Version != EMU_IOCTL_VERSION) {
+                Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+                Irp->IoStatus.Information = 0;
+                status = STATUS_INVALID_PARAMETER;
+                IoCompleteRequest(Irp, IO_NO_INCREMENT);
+                return status;
+            }
+            rate = input->Value;
+        }
+
+        ExAcquireFastMutex(&Ctx->StateLock);
+        if (action == EmuIoctlTestStart) {
+            op = EmuIsochStartStreams(Ctx, rate);
+            EmuNoteStatusValue(Ctx, L"TestStartStatus", (ULONG)op);
+        } else if (action == EmuIoctlTestStop) {
+            EmuIsochStopAll(Ctx);
+            // Back to idle on what is known to be a live bus - the release
+            // path cannot do this step, which is why it lives here.
+            for (ULONG dir = 0; dir < 2; dir++) {
+                if (Ctx->Stream[dir].AltSetting != 0) {
+                    EmuUsbSelectInterface(Ctx, dir,
+                                          Ctx->Stream[dir].InterfaceNumber, 0);
+                }
+            }
+            EmuNoteStatusValue(Ctx, L"TestStopStatus", (ULONG)STATUS_SUCCESS);
+        }
+        EmuIsochFillStats((PEMU_TEST_STREAM_STATS)reply, Ctx);
+        ExReleaseFastMutex(&Ctx->StateLock);
+
+        if (!NT_SUCCESS(op)) {
+            Irp->IoStatus.Status = op;
+            Irp->IoStatus.Information = Decision->OutputBytes;
+        } else {
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            Irp->IoStatus.Information = Decision->OutputBytes;
+        }
     } else {
         // GET_STATE and all four SET operations answer with the state
         // snapshot. The SETs read their EMU_SET_INPUT from this same buffer
