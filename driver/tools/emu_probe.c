@@ -18,6 +18,9 @@
 #include <string.h>
 #include "emu_ioctl.h"
 
+// Defined near the bottom; the test-stream helpers call it earlier.
+static void PrintWin32Error(const char* what, DWORD err);
+
 static const char* PnpStateName(ULONG s)
 {
     switch (s) {

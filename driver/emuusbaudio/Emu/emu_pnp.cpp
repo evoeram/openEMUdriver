@@ -1,4 +1,4 @@
-﻿// PnP lifecycle for the EmuUSBAudio PortCls FDO. Start brings up the USB client
+// PnP lifecycle for the EmuUSBAudio PortCls FDO. Start brings up the USB client
 // (emu_usb.cpp) and the private control interface (stage 4b); stop and remove
 // take both down again. No audio paths yet.
 // SPDX-License-Identifier: LGPL-2.1-or-later
@@ -90,6 +90,16 @@ extern "C" NTSTATUS EmuStartDevice(
         return status;
     }
 
+    // M4: publish real KS subdevices only after the USB client and descriptors
+    // are ready. A failed endpoint setup rolls the USB client back as well.
+    status = EmuWaveStart(context, Irp, ResourceList);
+    if (!NT_SUCCESS(status)) {
+        EMU_LOG_ERROR(STR_MODULENAME "WaveRT setup failed, 0x%x; start #%lu "
+                      "aborted\n", status, context->StartCount);
+        EmuUsbRelease(context);
+        return status;
+    }
+
     // Stage 4c: publish the started instance for the control device. The panel
     // opens \\.\EmuUSBAudioCtl and serves itself from this pointer; between
     // the publish and an IOCTL the control path additionally references the
@@ -149,6 +159,7 @@ extern "C" NTSTATUS NTAPI EmuPnpHandler(
         // START re-registers the handle and re-reads the descriptor. The PDO is
         // still attached, so the close is ordered correctly.
         InterlockedExchangePointer((PVOID volatile *)&EmuControlAdapter, NULL);
+        EmuWaveStop(context);
         EmuUsbRelease(context);
         EMU_LOG_TERSE(STR_MODULENAME "stopped (%p), stop #%lu\n",
                       DeviceObject, context->StopCount);
@@ -185,6 +196,7 @@ extern "C" NTSTATUS NTAPI EmuPnpHandler(
         // nothing allocated and no initialized state lock, so its release is
         // skipped rather than run against uninitialized sync state.
         if (context->Signature == EMU_CTX_SIGNATURE) {
+            EmuWaveStop(context);
             EmuUsbRelease(context);
         }
         EMU_LOG_TERSE(STR_MODULENAME "removed (%p), remove #%lu\n",

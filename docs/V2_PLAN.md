@@ -1,4 +1,4 @@
-﻿# openEMUdriver v2 — kernel-драйвер (WASAPI + ASIO)
+# openEMUdriver v2 — kernel-драйвер (WASAPI + ASIO)
 
 Статус и карта работ. Продолжение отсюда = новая сессия начинается с раздела
 «Что реально есть сейчас» и таблицы этапов.
@@ -1108,6 +1108,179 @@ M3) и ksoak под Verifier снова.
 Примечание к пробам 4b: root-причина «интерфейс не включается» была
 ложной — pnputil показывал «Включено» с самого начала, настоящий отказ
 происходил в KS на CREATE.
+
+### M3-B железный прогон (2026-11-06): test-start завис — self-deadlock
+на StateLock; фикс 2.0.0.24
+
+Живой образ подтвердился (`EntryBread = 24`), контрольное устройство и
+GET_CAPS/GET_STATE на живой 0404 — `emu-probe: PASS`. Но `test-start 48000`
+завис навсегда: поток пробника застрял в ядре, `TestStartStatus`/`TestPipe*`
+не записаны, процесс невозможно убить (thread в невзрываемом
+KeWaitForSingleObject).
+
+**Корень: рекурсивное приобретение fast mutex.** TEST-ветка диспетчера берёт
+`StateLock` и под ним зовёт `EmuIsochStartStreams` → `EmuUsbExecuteSet` →
+второй `ExAcquireFastMutex(&Ctx->StateLock)` на мьютекс, уже принадлежащий
+тому же потоку — ожидание самого себя, без таймаута и без отмены. Панельные
+SET работали потому, что их ветка диспетчера лок не держит (ExecuteSet берёт
+его сама). Юнит-тесты этого класса не ловят: блокировки в них не исполняются.
+
+Фикс (2.0.0.24, `EntryBread = 0x19`): тело SET-пути вынесено в
+`EmuUsbExecuteSetLocked` (требует удерживаемый лок; публичный
+`EmuUsbExecuteSet` стал обёрткой acquire/release); START-путь зовёт Locked
+и пишет breadcrumb `TestSetStatus` — если зависание повторится, отсутствие
+этого значения прибивает его к EP0-шагу, а не к select'ам/движку. Инвариант
+закреплён комментарием в TEST-ветке: StateLock держится на всю операцию,
+внутри — только Locked-вариант.
+
+Следствие заклинившего состояния: поток держит StateLock навсегда, поэтому
+`EmuUsbRelease` (берёт тот же лок) тоже виснет — **любая PnP-операция над
+devnode (remove/disable/uninstall) зависает**, обычный kinstall неприменим.
+Выход — только перезагрузка; драйверное восстановление без kernel
+debugger'а невозможно. После ребута — kinstall (перевязка на 2.0.0.24) и
+вторая перезагрузка (закон «образ живёт до перезагрузки»), затем вердикт.
+
+### M3-B железный прогон (2026-11-06): BSOD 0x144/3 на START; фикс 2.0.0.25
+
+После исправления self-deadlock версия 2.0.0.24 дошла до запуска ISO-движка,
+но `emu-probe.exe test-start 48000` завершился bugcheck `0x144/3`
+(`USB3_BUGCODE_CLIENT_CORRUPTED_URB`) в 02:06. Дамп `_sym/crash1.dmp`:
+процесс `emu-probe.exe`, модуль `emuusbaudio.sys`, URB расположен на стеке
+вызывающего потока. Это локальный `frameUrb` для
+`URB_FUNCTION_GET_CURRENT_FRAME_NUMBER`: contract-602 требует выделять URB
+через `USBD_xxxUrbAllocate`, а не передавать USB-стеку самодельную структуру.
+
+Фикс (2.0.0.25, `EntryBread = 0x1A`): `frameUrb` выделяется через
+`USBD_UrbAllocate` и освобождается после синхронного submit. Та же ошибка
+закрыта превентивно в STOP: `abortUrb` для `URB_FUNCTION_ABORT_PIPE` тоже
+выделяется через handle и освобождается после завершения. Поиск по kernel-
+исходникам подтвердил, что других stack-local URB в `Emu/` не осталось.
+
+Проверка без железа: `driver/utest.sh` — 5/5 binaries, 707 проверок PASS;
+полный `kbuild.sh` успешен; Inf2Cat — 0 ошибок/предупреждений; `.sys` и `.cat`
+подписаны, `signtool verify /pa` успешен. Но последующий живой START выявил
+следующий дефект — bugcheck 0x7E при повторной отправке isochronous IRP.
+
+### M3-B железный прогон (2026-11-06): BSOD 0x7E; фикс 2.0.0.26
+
+На 2.0.0.25 живой `emu-probe.exe test-start 48000` вызвал
+`SYSTEM_THREAD_EXCEPTION_NOT_HANDLED (0x7E)`, `ACCESS_VIOLATION` при чтении
+`0x220` в `nt!KeInsertQueueApc`. Дамп `_crash/20261106-1015/crash.dmp` показывает
+путь завершения `IopfCompleteRequest` → `IofCompleteRequest` → `UsbHub3`;
+системный поток начат в `EmuIsochWorker`, повторный submit находится в
+`EmuIsochSubmitSlot`.
+
+IRP выделялся один раз через `IoAllocateIrp`, а completion routine регистрировалась
+только при setup. Перед повторной отправкой не вызывался `IoReuseIrp`, поэтому
+состояние и текущая stack location после первого completion не
+переинициализировались. Кроме того, `NotificationEvent` оставался signalled:
+последующий wait мог завершиться до реального completion и допустить harvest
+ещё активного IRP.
+
+Фикс (2.0.0.26, `EntryBread = 0x1B`): каждый submit начинается с `IoReuseIrp`
+и `KeClearEvent`, затем заново заполняет stack location и регистрирует
+`EmuIsochCompletion` через `IoSetCompletionRoutineEx`. Однократная регистрация
+при setup удалена.
+
+Железный вердикт (2026-11-06 10:33): установленная 2.0.0.26 подтверждена
+`DriverVersion = 2.0.0.26`, `EntryBread = 27`, устройство `OK`. Полный скрипт
+`m3b-verdict.ps1` завершился без bugcheck: START 48 kHz — exit 0, оба направления
+running, повторные stats показали рост submits/completes/bytes; `urb-fail = 0`,
+`pkt-err = 0`, последний URB/packet status — 0. STOP — exit 0, оба направления
+idle, submits равны completes (render 4467975, capture 4431930), повторные stats
+не изменились. `TestSetStatus`, `TestStartStatus`, `TestStopStatus` — 0;
+новых событий bugcheck 1001 нет. Этот конкретный START/STOP пройден.
+
+### M4, этап 1 (2026-11-06): формат и арифметика WaveRT
+
+Добавлены dual-target `Emu/emu_audio.h` + `emu_audio.cpp` — чистые helpers без
+зависимости от PortCls и USB. `EmuAudioPack24` отбрасывает младший байт каждого
+32-битного host-sample и копирует старшие 24 бита в packed-24 USB;
+`EmuAudioUnpack24` выполняет обратное left-alignment с нулевым младшим байтом.
+`EmuAudioRingSpans` раскладывает запрос не более чем на два непрерывных участка
+циклического буфера, включая запрос больше самого ring. `EmuAudioPositions`
+переводит 64-битный счётчик завершённых аудиофреймов в linear bytes и ring offset,
+отклоняя переполнение и невыровненные параметры.
+
+`driver/utest.sh audio`: 116 проверок PASS, включая ноль, максимум, минимум, −1,
+игнорируемые low bits, межканальный порядок, guard bytes, wrap и длинные позиции.
+Исходник также компилируется kernel-флагами с `/WX`; полный `utest.sh` —
+6/6 binaries, 823 проверки PASS. Модуль пока **не подключён**
+к miniport/ISO и не входит в установленную 2.0.0.26 — поведение живого драйвера
+этим этапом не менялось. Следующий шаг: render WaveRT miniport с одним форматом
+48 kHz / stereo / 24-in-32, реальным ring buffer и позицией от USB completions;
+ToneGenerator, SaveData и таймерную эмуляцию в новый путь не переносить.
+
+### M4, этап 2 (2026-11-06): render WaveRT, кандидат 2.0.0.27
+
+Добавлены `Emu/emu_wave.h` + `emu_wave.cpp`: native PortCls WaveRT render и
+topology miniport, минимальный adapter power object, WaveRT buffer allocation,
+notifications и `IMiniportWaveRTOutputStream`. `EmuWaveStart` публикует
+`WaveEmuRender`/`TopologyEmuRender` только после успешной USB-инициализации;
+INF подключает `KS.Registration` + `WDMAUDIO.Registration` и только `wdmaud`.
+Единственный формат этого среза — 48 kHz / stereo / 24 valid bits в 32-bit
+containers; capture WaveRT ещё не реализован.
+
+Host ring заполняется клиентом WASAPI, `FillUsbPacket` преобразует его в
+packed-24 непосредственно перед каждым OUT submit, включая prime. Внешняя
+позиция двигается только после полного успешного USB completion; failed,
+cancelled и short OUT packet идут в error counters и не двигают позицию.
+RUN→PAUSE сохраняет completed count, PAUSE→RUN продолжает ring с сохранённой
+позиции, STOP сбрасывает её. Обнаруженные при review пути teardown усилены:
+reference на worker-thread получается с сохранённым fallback handle без
+двойного close; если completion не завершился за drain timeout, весь набор
+IRP/URB/common buffer сохраняется, а повторный старт направления отклоняется,
+чтобы USB stack не получил UAF. Notification buffer обязан иметь целое число
+host-frames как в полном ring, так и в каждом notification period.
+
+Проверено без железа: полная сборка `emuusbaudio.sys` успешна; `utest.sh` —
+6/6 binaries, 823 проверки PASS; `git diff --check` — без ошибок (только
+предупреждения LF→CRLF). `DriverVer=11/06/2026,2.0.0.27`,
+`EntryBread=0x1C`. `driver/package-ks` собран заново: Inf2Cat — 0 ошибок и
+0 предупреждений; `.sys` и `.cat` подписаны тестовым сертификатом
+`CN=FreeA2dp Test Signing`, `signtool verify /pa` успешен для обоих файлов.
+`tools/wasapi-test.cpp` теперь нумерует только render endpoints, поэтому индекс
+из обычного списка соответствует `-p <idx>`; сам probe собирается с `/Werror`
+аналогом MinGW и на системе без активного E-MU endpoint корректно перечисляет
+остальные render-устройства.
+
+**Железный вердикт ещё не получен.** Установка 12:12 обновила INF до
+`DriverVersion=2.0.0.27`; devnode `OK`, служба running, а
+`C:\Windows\System32\drivers\emuusbaudio.sys` побайтно совпадает с подписанным
+пакетом (SHA-256 `bb22abc9…7fb3f8` на том прогоне). Reference-интерфейсы
+`WaveEmuRender`/`TopologyEmuRender` есть в registry, но активного WASAPI
+endpoint нет. Главная причина: `EntryBread=27` (`0x1B`), то есть в памяти
+остаётся старый код 2.0.0.26 — повторное создание devnode не выгрузило image.
+Это ещё не verdict о новом WaveRT: его `DriverEntry` не выполнялся.
+`kinstall.ps1` теперь ждёт остановку службы до 10 секунд и, если старый image
+остался загружен, явно требует reboot вместо общего «Next»; синтаксис скрипта
+проверен parser'ом PowerShell.
+
+Для текущего пакета требуется одна перезагрузка, затем проверка
+`EntryBread=0x1C` и активного E-MU render endpoint. WASAPI shared/event-driven,
+START/STOP/PAUSE/RESUME, реальные позиции/notifications и отсутствие BSOD на
+новом пути не проверялись. После подтверждения версии найти E-MU через
+`bin/wasapi-test.exe`, проиграть тон через `-p`, затем снять
+`emu-probe test-stats` и проверить `WaveStartStatus`, рост render completes и
+нулевые USB errors. Только после этого — event-driven и повторные переходы
+состояний; этот этап нельзя считать аппаратно завершённым по сборке и тестам.
+
+### M4, аппаратный блокер ACL и 2.0.0.28 (2026-11-06, 12:23)
+
+После reboot подтверждены `EntryBread=0x1C` и активный E-MU WASAPI render
+endpoint (index 3). Однако `wasapi-test -p 3` и из обычного, и из elevated
+shell останавливается на `GetMixFormat`: `0x80070005 (E_ACCESSDENIED)`.
+`WaveStartStatus` отсутствует, оба ISO-направления idle, submits/completes = 0:
+SET_RATE и USB START ещё не вызывались. В INF оставался skeleton-ACL
+`SDDL_DEVOBJ_SYS_ALL_ADM_ALL`; Windows Audio открывает KS filter от имени
+сервиса, а не elevated-клиента.
+
+Версия 2.0.0.28 (`EntryBread=0x1D`) заменяет его на ACL штатных
+`usbaudio2.inf`/`hdaudio.inf`: SYSTEM GA, Administrators/Everyone/RC GRGWGX.
+Приватный `EmuUSBAudioCtl` остаётся строго admin-only. Полная сборка и
+`utest.sh` снова успешны (6/6, 823 проверки), Inf2Cat — 0/0, `.sys` и `.cat`
+подписаны. Установка .28 и повторный WASAPI START ещё не выполнялись; вердикт
+о ring/positions по-прежнему впереди.
 
 ## Тесты (обязательные)
 

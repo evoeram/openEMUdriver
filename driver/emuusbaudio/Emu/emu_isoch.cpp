@@ -86,8 +86,7 @@ EmuIsochSlotBytes(
 
 // The URB completion routine: signal the slot's event and keep the IRP. Iso
 // completions arrive at DISPATCH_LEVEL, which is exactly why it does nothing
-// else. Registered once per slot at start; the stack location's completion
-// fields survive the re-init the resubmit performs.
+// else. The routine is registered afresh for every submission.
 static NTSTATUS NTAPI
 EmuIsochCompletion(
     _In_ PDEVICE_OBJECT DeviceObject,
@@ -104,8 +103,8 @@ EmuIsochCompletion(
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
-// One URB submission on a slot's reused IRP. The stack location is re-armed
-// each time; the completion routine registered at slot setup stays in place.
+// One URB submission on a slot's reused IRP. Reinitialize the IRP, clear the
+// previous completion event and re-arm the stack location on every submission.
 static NTSTATUS
 EmuIsochSubmitSlot(
     _Inout_ PEMU_ISOCH_STREAM      S,
@@ -117,11 +116,19 @@ EmuIsochSubmitSlot(
     PIO_STACK_LOCATION stack;
     NTSTATUS           status;
 
+    IoReuseIrp(slot->Irp, STATUS_SUCCESS);
+    KeClearEvent(&slot->Done);
     stack = IoGetNextIrpStackLocation(slot->Irp);
     stack->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
     // AssignUrbToIoStackLocation writes both the URB pointer and the
     // IOCTL_INTERNAL_USB_SUBMIT_URB control code into the location.
     USBD_AssignUrbToIoStackLocation(Ctx->UsbdHandle, stack, slot->Urb);
+    status = IoSetCompletionRoutineEx(Ctx->Pdo, slot->Irp,
+                                      EmuIsochCompletion, &slot->Done,
+                                      TRUE, TRUE, TRUE);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
     slot->Submitted = TRUE;
     InterlockedIncrement(&S->Submits);
@@ -136,9 +143,9 @@ EmuIsochSubmitSlot(
     return status;
 }
 
-// Per-submit URB fields: everything but the buffer pointer, which never
-// changes for a slot.
-static VOID
+// Per-submit URB fields: everything but the slot buffer address, which never
+// changes. WaveRT data is packed immediately before every submit, prime included.
+static NTSTATUS
 EmuIsochArmUrb(
     _Inout_ PEMU_ISOCH_STREAM S,
     _Inout_ PEMU_ISOCH_SLOT   Slot,
@@ -147,6 +154,21 @@ EmuIsochArmUrb(
 {
     struct _URB_ISOCH_TRANSFER* u = &Slot->Urb->UrbIsochronousTransfer;
     ULONG packetBytes = S->NominalFrames * S->BytesPerFrame;
+    PUCHAR transferBuffer = S->Buffer +
+        (ULONG)(Slot - &S->Slots[0]) * S->SlotBytes;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (Out && S->FillRender != NULL) {
+        status = S->FillRender(S->CallbackContext, transferBuffer,
+                               S->NominalFrames,
+                               S->BaseFrames + (ULONGLONG)S->SubmittedFrames);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        // Only the worker writes this counter. It describes data consumed into
+        // USB slot buffers, never the externally visible playback position.
+        S->SubmittedFrames += S->NominalFrames;
+    }
 
     u->Hdr.Function = URB_FUNCTION_ISOCH_TRANSFER;
     u->Hdr.Length = (USHORT)sizeof(struct _URB_ISOCH_TRANSFER);
@@ -155,8 +177,7 @@ EmuIsochArmUrb(
     u->TransferFlags = Out
         ? USBD_TRANSFER_DIRECTION_OUT
         : (USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK);
-    u->TransferBuffer = S->Buffer +
-        (ULONG)(Slot - &S->Slots[0]) * S->SlotBytes;
+    u->TransferBuffer = transferBuffer;
     u->TransferBufferLength = Out ? packetBytes : S->SlotBytes;
     u->StartFrame = Slot->NextFrame;
     u->NumberOfPackets = 1;
@@ -164,10 +185,12 @@ EmuIsochArmUrb(
     u->IsoPacket[0].Length = Out ? packetBytes : S->SlotBytes;
     u->IsoPacket[0].Status = 0;
     Slot->NextFrame += S->PeriodMs;
+    return STATUS_SUCCESS;
 }
 
-// Read one completion into the counters. Canceled slots (the stop path's
-// abort) land here too and are counted honestly - a stop is not a clean run.
+// Read one completion into the counters. A render frame becomes visible to
+// WaveRT only after its complete packet succeeded on the wire; cancelled,
+// failed and short packets remain visible in the error counters instead.
 static VOID
 EmuIsochHarvest(
     _Inout_ PEMU_ISOCH_STREAM S,
@@ -178,16 +201,20 @@ EmuIsochHarvest(
     struct _URB_ISOCH_TRANSFER* u = &Slot->Urb->UrbIsochronousTransfer;
     ULONG packetBytes = S->NominalFrames * S->BytesPerFrame;
     ULONG got;
+    BOOLEAN irpSuccess = NT_SUCCESS(Slot->Irp->IoStatus.Status);
+    BOOLEAN urbSuccess = NT_SUCCESS((NTSTATUS)u->Hdr.Status);
+    BOOLEAN packetSuccess = USBD_SUCCESS(u->IsoPacket[0].Status);
 
     Slot->Submitted = FALSE;
     InterlockedIncrement(&S->Completes);
 
-    if (!NT_SUCCESS(Slot->Irp->IoStatus.Status) ||
-        !NT_SUCCESS((NTSTATUS)u->Hdr.Status)) {
+    if (!irpSuccess || !urbSuccess) {
         InterlockedIncrement(&S->UrbFailures);
-        InterlockedExchange(&S->LastUrbStatus, (LONG)u->Hdr.Status);
+        InterlockedExchange(&S->LastUrbStatus,
+                            !irpSuccess ? (LONG)Slot->Irp->IoStatus.Status
+                                        : (LONG)u->Hdr.Status);
     }
-    if (!USBD_SUCCESS(u->IsoPacket[0].Status)) {
+    if (!packetSuccess) {
         InterlockedIncrement(&S->IsoPacketErrors);
         InterlockedExchange(&S->LastPacketStatus,
                             (LONG)u->IsoPacket[0].Status);
@@ -197,6 +224,15 @@ EmuIsochHarvest(
         InterlockedIncrement(&S->ShortPackets);
     }
     InterlockedAdd(&S->Bytes, (LONG)got);
+
+    if (Out && irpSuccess && urbSuccess && packetSuccess &&
+        got == packetBytes) {
+        S->CompletedFrames += S->NominalFrames;
+        if (S->RenderCompleted != NULL) {
+            S->RenderCompleted(S->CallbackContext,
+                               (ULONGLONG)S->CompletedFrames);
+        }
+    }
 }
 
 // The OUT pattern: a 24-bit counter ramp, both channels carrying the same
@@ -246,7 +282,10 @@ EmuIsochWorker(
     drainTimeout.QuadPart = -2 * 1000 * 10000LL;   // 2 s, tripwire only
 
     for (ULONG i = 0; i < EMU_ISOCH_SLOTS; i++) {
-        status = EmuIsochSubmitSlot(S, Ctx, i);
+        status = EmuIsochArmUrb(S, &S->Slots[i], out);
+        if (NT_SUCCESS(status)) {
+            status = EmuIsochSubmitSlot(S, Ctx, i);
+        }
         if (!NT_SUCCESS(status)) {
             EMU_LOG_ERROR(STR_MODULENAME "isoch slot %lu prime failed, 0x%x\n",
                           (ULONG)i, status);
@@ -254,24 +293,35 @@ EmuIsochWorker(
     }
 
     while (InterlockedCompareExchange(&S->Quit, 0, 0) == 0) {
+        BOOLEAN anySubmitted = FALSE;
+
         for (ULONG i = 0; i < EMU_ISOCH_SLOTS; i++) {
             PEMU_ISOCH_SLOT slot = &S->Slots[i];
 
             if (!slot->Submitted) {
                 continue;
             }
+            anySubmitted = TRUE;
             KeWaitForSingleObject(&slot->Done, Executive, KernelMode, FALSE,
                                   NULL);
             EmuIsochHarvest(S, slot, out);
             if (InterlockedCompareExchange(&S->Quit, 0, 0) != 0) {
                 break;
             }
-            EmuIsochArmUrb(S, slot, out);
-            status = EmuIsochSubmitSlot(S, Ctx, i);
+            status = EmuIsochArmUrb(S, slot, out);
+            if (NT_SUCCESS(status)) {
+                status = EmuIsochSubmitSlot(S, Ctx, i);
+            }
             if (!NT_SUCCESS(status)) {
                 EMU_LOG_ERROR(STR_MODULENAME "isoch slot %lu resubmit failed, "
                               "0x%x\n", (ULONG)i, status);
             }
+        }
+        if (!anySubmitted &&
+            InterlockedCompareExchange(&S->Quit, 0, 0) == 0) {
+            LARGE_INTEGER retryDelay;
+            retryDelay.QuadPart = -10000LL; // 1 ms; no failed-submit busy spin
+            KeDelayExecutionThread(KernelMode, FALSE, &retryDelay);
         }
     }
 
@@ -297,9 +347,30 @@ EmuIsochWorker(
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-// Free what a stream owns. Every call site has already stopped the thread and
-// drained its IRPs; slots still marked Submitted are a stuck completion and
-// are skipped (leaked) rather than freed under an outstanding IRP.
+// A slot still marked Submitted may reference any other slot's URB through
+// the shared USBD handle, and always references the stream's common buffer.
+// In that case retain the whole allocation set: freeing only the quiet slots
+// would be just as unsafe as freeing the stuck one.
+#pragma code_seg("PAGE")
+static BOOLEAN
+EmuIsochHasOutstandingSlots(
+    _In_ PEMU_ISOCH_STREAM S
+    )
+{
+    PAGED_CODE();
+
+    for (ULONG i = 0; i < EMU_ISOCH_SLOTS; i++) {
+        if (S->Slots[i].Submitted) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// Free what a stream owns. Every normal call site has already stopped the
+// thread and drained its IRPs. A stuck completion retains the entire stream;
+// StartStream rejects reuse until the device instance is gone rather than
+// overwriting a slot or freeing memory that the USB stack can still access.
 #pragma code_seg("PAGE")
 static VOID
 EmuIsochFreeStream(
@@ -311,16 +382,25 @@ EmuIsochFreeStream(
 
     PAGED_CODE();
 
+    if (S->ThreadHandle != NULL) {
+        // Reached only when ObReferenceObjectByHandle failed; StopStream has
+        // already waited on this handle before any slot storage is released.
+        ZwClose(S->ThreadHandle);
+        S->ThreadHandle = NULL;
+    }
+
+    if (EmuIsochHasOutstandingSlots(S)) {
+        EMU_LOG_ERROR(STR_MODULENAME "isoch dir %lu retained: completion still "
+                      "in flight at free\n", Direction);
+        S->Active = FALSE;
+        return;
+    }
+
     for (ULONG i = 0; i < EMU_ISOCH_SLOTS; i++) {
         PEMU_ISOCH_SLOT slot = &S->Slots[i];
 
         if (slot->Irp != NULL) {
-            if (slot->Submitted) {
-                EMU_LOG_ERROR(STR_MODULENAME "isoch slot %lu leaked (in "
-                              "flight at free)\n", i);
-            } else {
-                IoFreeIrp(slot->Irp);
-            }
+            IoFreeIrp(slot->Irp);
             slot->Irp = NULL;
         }
         if (slot->Urb != NULL) {
@@ -335,6 +415,13 @@ EmuIsochFreeStream(
     S->Active = FALSE;
     S->Quit = 0;
     S->Pipe = NULL;
+    S->CallbackContext = NULL;
+    S->FillRender = NULL;
+    S->RenderCompleted = NULL;
+    S->BaseFrames = 0;
+    S->SubmittedFrames = 0;
+    // CompletedFrames survives until the next start: WaveRT reads it after the
+    // worker has drained to preserve RUN -> PAUSE -> RUN positioning.
 }
 
 // Stop one direction: quit flag, pipe abort, thread drain, then free. The
@@ -348,7 +435,7 @@ EmuIsochStopStream(
     )
 {
     PEMU_ISOCH_STREAM         S = &Ctx->Isoch[Direction];
-    struct _URB               abortUrb;
+    PURB                      abortUrb = NULL;
     NTSTATUS                  status;
 
     PAGED_CODE();
@@ -359,14 +446,22 @@ EmuIsochStopStream(
     InterlockedExchange(&S->Quit, 1);
 
     if (S->Pipe != NULL) {
-        // Abort every queued transfer on the data pipe: the worker's drain
-        // waits depend on each of them completing, canceled or not.
-        abortUrb.UrbPipeRequest.Hdr.Function = URB_FUNCTION_ABORT_PIPE;
-        abortUrb.UrbPipeRequest.Hdr.Length =
-            (USHORT)sizeof(struct _URB_PIPE_REQUEST);
-        abortUrb.UrbPipeRequest.Hdr.Status = 0;
-        abortUrb.UrbPipeRequest.PipeHandle = S->Pipe;
-        status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, &abortUrb);
+        // Contract-602 tracks URB allocations in the USBD handle. A stack URB
+        // is rejected by USB3 with bugcheck 0x144/3 before the request runs.
+        status = USBD_UrbAllocate(Ctx->UsbdHandle, &abortUrb);
+        if (NT_SUCCESS(status)) {
+            // Abort every queued transfer on the data pipe: the worker's drain
+            // waits depend on each of them completing, canceled or not.
+            abortUrb->UrbPipeRequest.Hdr.Function = URB_FUNCTION_ABORT_PIPE;
+            abortUrb->UrbPipeRequest.Hdr.Length =
+                (USHORT)sizeof(struct _URB_PIPE_REQUEST);
+            abortUrb->UrbPipeRequest.Hdr.Status = 0;
+            abortUrb->UrbPipeRequest.PipeHandle = S->Pipe;
+            status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, abortUrb);
+            // EmuUsbSubmitUrb is synchronous, so the allocation is no longer
+            // referenced by its IRP at this point.
+            USBD_UrbFree(Ctx->UsbdHandle, abortUrb);
+        }
         if (!NT_SUCCESS(status)) {
             EMU_LOG_WARN(STR_MODULENAME "abort pipe (dir %lu) failed, 0x%x\n",
                          Direction, status);
@@ -378,6 +473,9 @@ EmuIsochStopStream(
                               NULL);
         ObDereferenceObject(S->ThreadObject);
         S->ThreadObject = NULL;
+    } else if (S->ThreadHandle != NULL) {
+        KeWaitForSingleObject(S->ThreadHandle, Executive, KernelMode, FALSE,
+                              NULL);
     }
     EmuIsochFreeStream(Ctx, Direction);
 }
@@ -391,6 +489,25 @@ EmuIsochStopAll(
 
     EmuIsochStopStream(Ctx, EMU_STREAM_RENDER);
     EmuIsochStopStream(Ctx, EMU_STREAM_CAPTURE);
+}
+
+VOID
+EmuIsochStopRender(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx
+    )
+{
+    PAGED_CODE();
+
+    EmuIsochStopStream(Ctx, EMU_STREAM_RENDER);
+}
+
+ULONGLONG
+EmuIsochRenderCompletedFrames(
+    _In_ PEMU_DEVICE_CONTEXT Ctx
+    )
+{
+    return (ULONGLONG)InterlockedCompareExchange64(
+        &Ctx->Isoch[EMU_STREAM_RENDER].CompletedFrames, 0, 0);
 }
 
 // Arm one direction: select the alternate, read the pipe facts out of the
@@ -407,7 +524,7 @@ EmuIsochStartStream(
     PUSBD_INTERFACE_INFORMATION  iface;
     PUSBD_PIPE_INFORMATION       dataPipe = NULL;
     PUSBD_PIPE_INFORMATION       feedbackPipe = NULL;
-    struct _URB                  frameUrb;
+    PURB                         frameUrb = NULL;
     OBJECT_ATTRIBUTES            oa;
     HANDLE                       threadHandle;
     ULONG                        base;
@@ -415,6 +532,13 @@ EmuIsochStartStream(
     NTSTATUS                     status;
 
     PAGED_CODE();
+
+    if (S->Active || S->ThreadObject != NULL || S->ThreadHandle != NULL ||
+        EmuIsochHasOutstandingSlots(S)) {
+        // A retained stuck stream cannot be reused without overwriting storage
+        // that an outstanding USB request may still reference.
+        return STATUS_DEVICE_BUSY;
+    }
 
     status = EmuUsbSelectInterface(Ctx, Direction,
                                    Alt->InterfaceNumber, Alt->AltSetting);
@@ -465,6 +589,16 @@ EmuIsochStartStream(
     S->Owner = Ctx;
     S->Direction = Direction;
     S->RateHz = RateHz;
+    S->SubmittedFrames = 0;
+    InterlockedExchange64(&S->CompletedFrames, 0);
+    InterlockedExchange(&S->Submits, 0);
+    InterlockedExchange(&S->Completes, 0);
+    InterlockedExchange(&S->UrbFailures, 0);
+    InterlockedExchange(&S->IsoPacketErrors, 0);
+    InterlockedExchange(&S->ShortPackets, 0);
+    InterlockedExchange(&S->Bytes, 0);
+    InterlockedExchange(&S->LastUrbStatus, 0);
+    InterlockedExchange(&S->LastPacketStatus, 0);
     S->Pipe = dataPipe->PipeHandle;
     S->FeedbackPipe = feedbackPipe != NULL ? feedbackPipe->PipeHandle : NULL;
     S->MaxPacketSize = dataPipe->MaximumPacketSize;
@@ -503,9 +637,11 @@ EmuIsochStartStream(
         EmuIsochFreeStream(Ctx, Direction);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    if (out) {
+    if (out && S->FillRender == NULL) {
         EmuIsochFillOutPattern(S);
     } else {
+        // WaveRT slots are filled afresh by the prime pass; capture and any
+        // not-yet-submitted headroom begin as silence rather than stale data.
         RtlZeroMemory(S->Buffer, (SIZE_T)EMU_ISOCH_SLOTS * S->SlotBytes);
     }
 
@@ -524,33 +660,33 @@ EmuIsochStartStream(
             EmuIsochFreeStream(Ctx, Direction);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        slot->Irp->IoStatus.Status = STATUS_SUCCESS;
-        // The completion routine is registered once; resubmissions re-arm the
-        // stack location's function and URB pointer but keep these fields.
-        status = IoSetCompletionRoutineEx(Ctx->Pdo, slot->Irp,
-                                          EmuIsochCompletion, &slot->Done,
-                                          TRUE, TRUE, TRUE);
-        if (!NT_SUCCESS(status)) {
-            EmuIsochFreeStream(Ctx, Direction);
-            return status;
-        }
     }
 
     // Reserve the frame window: current frame plus the margin, slot i covering
-    // the i-th period out. Late submissions are counted, not hidden.
-    frameUrb.UrbGetCurrentFrameNumber.Hdr.Function =
-        URB_FUNCTION_GET_CURRENT_FRAME_NUMBER;
-    frameUrb.UrbGetCurrentFrameNumber.Hdr.Length =
-        (USHORT)sizeof(struct _URB_GET_CURRENT_FRAME_NUMBER);
-    frameUrb.UrbGetCurrentFrameNumber.Hdr.Status = 0;
-    status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, &frameUrb);
+    // the i-th period out. Late submissions are counted, not hidden. This URB
+    // must come from the contract-602 handle too: the 2.0.0.24 stack-local
+    // frameUrb caused bugcheck 0x144/3 on the first hardware START.
+    status = USBD_UrbAllocate(Ctx->UsbdHandle, &frameUrb);
+    if (NT_SUCCESS(status)) {
+        frameUrb->UrbGetCurrentFrameNumber.Hdr.Function =
+            URB_FUNCTION_GET_CURRENT_FRAME_NUMBER;
+        frameUrb->UrbGetCurrentFrameNumber.Hdr.Length =
+            (USHORT)sizeof(struct _URB_GET_CURRENT_FRAME_NUMBER);
+        frameUrb->UrbGetCurrentFrameNumber.Hdr.Status = 0;
+        status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, frameUrb);
+    }
     if (!NT_SUCCESS(status)) {
         EMU_LOG_ERROR(STR_MODULENAME "current frame query failed, 0x%x\n",
                       status);
+        if (frameUrb != NULL) {
+            USBD_UrbFree(Ctx->UsbdHandle, frameUrb);
+        }
         EmuIsochFreeStream(Ctx, Direction);
         return status;
     }
-    base = frameUrb.UrbGetCurrentFrameNumber.FrameNumber + EMU_ISOCH_FRAME_MARGIN;
+    base = frameUrb->UrbGetCurrentFrameNumber.FrameNumber +
+           EMU_ISOCH_FRAME_MARGIN;
+    USBD_UrbFree(Ctx->UsbdHandle, frameUrb);
     for (ULONG i = 0; i < EMU_ISOCH_SLOTS; i++) {
         S->Slots[i].NextFrame = base + i * S->PeriodMs;
     }
@@ -567,22 +703,70 @@ EmuIsochStartStream(
         EmuIsochFreeStream(Ctx, Direction);
         return status;
     }
+    // Keep the kernel handle until the thread object reference exists. If that
+    // rare reference operation fails, StopStream can still abort and wait on
+    // the handle, and FreeStream closes it exactly once.
+    S->ThreadHandle = threadHandle;
     status = ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS,
                                        *PsThreadType, KernelMode,
                                        &S->ThreadObject, NULL);
     if (!NT_SUCCESS(status)) {
-        // The thread is running and we hold only the handle. KeWaitForSingle-
-        // Object accepts a thread handle directly, so the stop runs without
-        // the object pointer: quit, abort, wait on the handle, close it.
         S->ThreadObject = NULL;
         EmuIsochStopStream(Ctx, Direction);
-        KeWaitForSingleObject(threadHandle, Executive, KernelMode, FALSE,
-                              NULL);
-        ZwClose(threadHandle);
         return status;
     }
+    S->ThreadHandle = NULL;
     ZwClose(threadHandle);
     return STATUS_SUCCESS;
+}
+
+NTSTATUS
+EmuIsochStartRender(
+    _Inout_ PEMU_DEVICE_CONTEXT       Ctx,
+    _In_ ULONG                        RateHz,
+    _In_ ULONGLONG                    BaseFrames,
+    _Inout_ PVOID                     CallbackContext,
+    _In_ PEMU_ISOCH_FILL_RENDER       FillRender,
+    _In_ PEMU_ISOCH_RENDER_COMPLETED  RenderCompleted
+    )
+{
+    const EMU_STREAM_ALT* alt;
+    PEMU_ISOCH_STREAM S = &Ctx->Isoch[EMU_STREAM_RENDER];
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (RateHz != 48000 || CallbackContext == NULL || FillRender == NULL ||
+        RenderCompleted == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (S->Active) {
+        return STATUS_DEVICE_BUSY;
+    }
+    alt = EmuCapsFindAlt(Ctx->Caps, EMU_STREAM_RENDER, 2, RateHz);
+    if (alt == NULL) {
+        return STATUS_NO_MATCH;
+    }
+
+    status = EmuUsbExecuteSetLocked(Ctx, EmuIoctlSetRate, RateHz);
+    if (!NT_SUCCESS(status)) {
+        EmuNoteStatusValue(Ctx, L"WaveStartStatus", (ULONG)status);
+        return status;
+    }
+
+    S->CallbackContext = CallbackContext;
+    S->FillRender = FillRender;
+    S->RenderCompleted = RenderCompleted;
+    S->BaseFrames = BaseFrames;
+    status = EmuIsochStartStream(Ctx, EMU_STREAM_RENDER, alt, RateHz);
+    if (!NT_SUCCESS(status)) {
+        S->CallbackContext = NULL;
+        S->FillRender = NULL;
+        S->RenderCompleted = NULL;
+        S->BaseFrames = 0;
+    }
+    EmuNoteStatusValue(Ctx, L"WaveStartStatus", (ULONG)status);
+    return status;
 }
 
 NTSTATUS
@@ -617,7 +801,15 @@ EmuIsochStartStreams(
 
     // The rate goes through the existing SET path: descriptor veto, EP0
     // SET_CUR, cache note - the exact operation the panel contract drives.
-    status = EmuUsbExecuteSet(Ctx, EmuIoctlSetRate, RateHz);
+    // The dispatch holds StateLock across the whole start; the Locked variant
+    // is required here, the plain one would re-acquire the caller's mutex and
+    // wait on itself forever (the first hardware run of this IOCTL hung
+    // exactly there, before any of the breadcrumbs below could be written).
+    status = EmuUsbExecuteSetLocked(Ctx, EmuIoctlSetRate, RateHz);
+    // The wire verdict of the SET step, separate from TestStartStatus: if a
+    // later start hangs again, the absence of this value pins the hang to the
+    // EP0 request rather than to the selects or the stream engine.
+    EmuNoteStatusValue(Ctx, L"TestSetStatus", (ULONG)status);
     if (!NT_SUCCESS(status)) {
         return status;
     }

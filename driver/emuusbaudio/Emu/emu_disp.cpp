@@ -84,6 +84,13 @@ static NTSTATUS EmuCompleteQuery(
         // instrument, and its client is expected to fail loudly. The stats
         // reply still travels (METHOD_BUFFERED returns Information bytes),
         // so the failure comes with the counters that describe it.
+        //
+        // StateLock is held across the whole operation: START and STOP must
+        // serialize against each other and against a restart, and the SET
+        // step inside runs as EmuUsbExecuteSetLocked. Calling the plain
+        // EmuUsbExecuteSet here would re-acquire this fast mutex and wait on
+        // itself forever - that is the self-deadlock the first hardware run
+        // of the test start hit.
         EMU_IOCTL_ACTION action = Decision->Action;
         NTSTATUS         op = STATUS_SUCCESS;
         ULONG            rate = 0;

@@ -72,12 +72,25 @@ typedef struct _EMU_ISOCH_SLOT {
     BOOLEAN Submitted;      // whether the last submit is possibly in flight
 } EMU_ISOCH_SLOT, *PEMU_ISOCH_SLOT;
 
+typedef NTSTATUS (NTAPI *PEMU_ISOCH_FILL_RENDER)(
+    _Inout_ PVOID Context,
+    _Out_ PUCHAR Destination,
+    _In_ ULONG Frames,
+    _In_ ULONGLONG LinearFramePosition
+    );
+
+typedef VOID (NTAPI *PEMU_ISOCH_RENDER_COMPLETED)(
+    _Inout_ PVOID Context,
+    _In_ ULONGLONG CompletedFrames
+    );
+
 typedef struct _EMU_ISOCH_STREAM {
     BOOLEAN          Active;          // set once, cleared by the stop path
     LONG             Quit;            // interlocked stop flag for the thread
     PVOID            Owner;           // the owning EMU_DEVICE_CONTEXT
     ULONG            Direction;       // EMU_STREAM_RENDER / EMU_STREAM_CAPTURE
     PVOID            ThreadObject;    // referenced thread object, waited on stop
+    HANDLE           ThreadHandle;    // fallback until ObReferenceObject succeeds
     // Pipe facts, read out of the submitted select-interface URB's interface
     // information once at start and treated as read-only afterwards.
     USBD_PIPE_HANDLE Pipe;            // the data pipe (OUT 0x01 / IN 0x82)
@@ -91,6 +104,14 @@ typedef struct _EMU_ISOCH_STREAM {
     ULONG            SlotBytes;       // per-slot buffer size
     PUCHAR           Buffer;          // nonpaged, EMU_ISOCH_SLOTS * SlotBytes
     EMU_ISOCH_SLOT   Slots[EMU_ISOCH_SLOTS];
+    // WaveRT render callbacks. The worker fills from the host ring before every
+    // submit, including the prime pass, and reports only successful completions.
+    PVOID                       CallbackContext;
+    PEMU_ISOCH_FILL_RENDER      FillRender;
+    PEMU_ISOCH_RENDER_COMPLETED RenderCompleted;
+    ULONGLONG                   BaseFrames;
+    volatile LONGLONG           SubmittedFrames;
+    volatile LONGLONG           CompletedFrames;
     // Counters, all interlocked: the worker thread writes, the stats IOCTL
     // reads, and neither holds a lock against the other.
     volatile LONG    Submits;
@@ -163,6 +184,31 @@ NTSTATUS
 EmuIsochStartStreams(
     _Inout_ PEMU_DEVICE_CONTEXT Ctx,
     _In_ ULONG                  RateHz
+    );
+
+// Start only the WaveRT render direction. StateLock must already be held.
+// BaseFrames is the paused stream's preserved host-ring position; the fill
+// callback receives monotonically increasing positions beginning there.
+NTSTATUS
+EmuIsochStartRender(
+    _Inout_ PEMU_DEVICE_CONTEXT       Ctx,
+    _In_ ULONG                        RateHz,
+    _In_ ULONGLONG                    BaseFrames,
+    _Inout_ PVOID                     CallbackContext,
+    _In_ PEMU_ISOCH_FILL_RENDER       FillRender,
+    _In_ PEMU_ISOCH_RENDER_COMPLETED  RenderCompleted
+    );
+
+// Stop render and wait for its worker. The completed count remains readable
+// after the stop so RUN -> PAUSE can preserve it in the WaveRT base position.
+VOID
+EmuIsochStopRender(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx
+    );
+
+ULONGLONG
+EmuIsochRenderCompletedFrames(
+    _In_ PEMU_DEVICE_CONTEXT Ctx
     );
 
 // Stop both directions (idempotent; safe on a never-started instance).

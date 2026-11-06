@@ -1,4 +1,4 @@
-﻿// EmuUSBAudio — openEMUdriver v2 kernel driver.
+// EmuUSBAudio — openEMUdriver v2 kernel driver.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // PortCLS adapter for the E-MU USB audio interfaces. M1 was a PnP skeleton; M2
@@ -162,6 +162,16 @@ typedef struct _EMU_DEVICE_CONTEXT {
     // usage and dies with the instance. EmuIsochStartStreams arms them, the
     // test IOCTLs and EmuUsbRelease (via EmuIsochStopAll) retire them.
     EMU_ISOCH_STREAM              Isoch[2];
+
+    // M4 render endpoint. These are owning references returned by QueryInterface;
+    // the registration flags distinguish a created port from a registered KS
+    // subdevice so failed starts and repeated PnP stops share one teardown path.
+    PUNKNOWN                      AdapterUnknown;
+    PUNKNOWN                      WavePort;
+    PUNKNOWN                      TopologyPort;
+    BOOLEAN                       WavePortRegistered;
+    BOOLEAN                       TopologyPortRegistered;
+    BOOLEAN                       PhysicalConnectionRegistered;
 } EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
 // Stage 4c: the panel talks to a driver-owned control device object, not to
@@ -276,8 +286,23 @@ EmuNoteStatusValue(
 // One named DWORD into the service Parameters key - the diagnostic channel
 // of record on this machine (see EmuNoteProbeResult).
 
+// The panel-SET entry point: takes StateLock itself. Callers that already
+// hold the lock (the test-stream branch of the dispatch) must use the Locked
+// variant below - a fast mutex is not recursive, and a second acquire on the
+// same thread waits for itself forever.
 NTSTATUS
 EmuUsbExecuteSet(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ EMU_IOCTL_ACTION       Action,
+    _In_ ULONG                  Value
+    );
+
+// The same SET executor with StateLock already held by the caller. The SET
+// body runs bus operations while holding it; the lock serializes SETs, test
+// starts and stops against each other, which is exactly what the test branch
+// needs for its restart semantics.
+NTSTATUS
+EmuUsbExecuteSetLocked(
     _Inout_ PEMU_DEVICE_CONTEXT Ctx,
     _In_ EMU_IOCTL_ACTION       Action,
     _In_ ULONG                  Value
@@ -305,6 +330,19 @@ EmuUsbSubmitUrb(
     _In_ PDEVICE_OBJECT Target,
     _In_ USBD_HANDLE    Handle,
     _In_ PURB           Urb
+    );
+
+// emu_wave.cpp — M4 render WaveRT + topology endpoint pair.
+NTSTATUS
+EmuWaveStart(
+    _Inout_ PEMU_DEVICE_CONTEXT Context,
+    _In_opt_ PIRP Irp,
+    _In_opt_ PRESOURCELIST ResourceList
+    );
+
+VOID
+EmuWaveStop(
+    _Inout_ PEMU_DEVICE_CONTEXT Context
     );
 
 #endif // _EMU_USB_AUDIO_H_

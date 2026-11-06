@@ -282,13 +282,37 @@ EmuUsbExecuteSet(
     _In_ ULONG                  Value
     )
 {
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    ExAcquireFastMutex(&Ctx->StateLock);
+    status = EmuUsbExecuteSetLocked(Ctx, Action, Value);
+    ExReleaseFastMutex(&Ctx->StateLock);
+    return status;
+}
+
+// The SET body proper. The caller owns StateLock: the panel SET branch of the
+// dispatch calls this through EmuUsbExecuteSet, the test-stream branch holds
+// the lock across the whole start/stop and comes straight here. A fast mutex
+// is not recursive - the second ExAcquireFastMutex on the same thread would
+// wait on itself forever, which is exactly what the first hardware run of the
+// test start did (the probe stuck in TEST_STREAM_START, TestStartStatus
+// unwritten).
+#pragma code_seg("PAGE")
+NTSTATUS
+EmuUsbExecuteSetLocked(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx,
+    _In_ EMU_IOCTL_ACTION       Action,
+    _In_ ULONG                  Value
+    )
+{
     EMU_CTRL_REQUEST request;
     ULONG            unitId;
     NTSTATUS         status;
 
     PAGED_CODE();
 
-    ExAcquireFastMutex(&Ctx->StateLock);
 
     switch (Action) {
     case EmuIoctlSetRate:
@@ -356,7 +380,6 @@ EmuUsbExecuteSet(
     }
 
     Ctx->LastOperationStatus = status;
-    ExReleaseFastMutex(&Ctx->StateLock);
     return status;
 }
 

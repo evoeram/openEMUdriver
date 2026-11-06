@@ -1,12 +1,8 @@
-﻿; openEMUdriver v2 — kernel driver (PortCLS), M1 test-INF.
+; openEMUdriver v2 — kernel driver (PortCLS), M4 render WaveRT.
 ;
-; Binds the whole E-MU 0404 USB device to EmuUSBAudio.sys, which is the only
-; PID this stage is approved for. Whole-device on purpose: the CA0189 firmware
+; Binds the whole E-MU 0404 USB device to EmuUSBAudio.sys. The CA0189 firmware
 ; declares every audio interface as vendor-class 0xFF, so there is no usable
 ; usbccgp/MI_* split to bind against (see docs/RE_NOTES.md).
-;
-; M1 is a PnP skeleton: it registers no KS pins and creates no audio endpoints,
-; so WDMAUDIO.Registration is deliberately absent until M4 adds WaveRT filters.
 ;
 ; SPDX-License-Identifier: LGPL-2.1-or-later
 
@@ -16,7 +12,7 @@ Class       = Media
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = openemu-ks.cat
-DriverVer   = 11/04/2026,2.0.0.23
+DriverVer   = 11/06/2026,2.0.0.28
 PnpLockdown = 1
 
 [SourceDisksNames]
@@ -35,19 +31,35 @@ emuusbaudio.sys = 1
 ; E-MU 0404 USB
 ;==============================================================
 [Emu0404.Install]
-Include = ks.inf
-Needs   = KS.Registration
+Include = ks.inf,wdmaudio.inf
+Needs   = KS.Registration,WDMAUDIO.Registration
 CopyFiles = EmuKs.CopyList
 AddReg    = EmuKs.AddReg
 
 [Emu0404.Install.HW]
 AddReg = EmuKs.HwAddReg
 
-; No [Install.Interfaces] since stage 4c: the hardware run proved KS/PortCls
-; rejects IRP_MJ_CREATE on the adapter FDO, so a PDO-registered interface can
-; never be opened. The panel opens the driver-owned control device
-; \\.\EmuUSBAudioCtl instead (created in DriverEntry, admin-only); the IOCTL
-; contract lives in driver/emuusbaudio/Emu/emu_ioctl.h.
+[Emu0404.Install.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,%KSNAME_WaveEmuRender%,EmuKs.Wave.Interface
+AddInterface = %KSCATEGORY_RENDER%,%KSNAME_WaveEmuRender%,EmuKs.Wave.Interface
+AddInterface = %KSCATEGORY_AUDIO%,%KSNAME_TopologyEmuRender%,EmuKs.Topology.Interface
+
+[EmuKs.Wave.Interface]
+AddReg = EmuKs.Wave.AddReg
+
+[EmuKs.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%EmuKs.WaveName%
+
+[EmuKs.Topology.Interface]
+AddReg = EmuKs.Topology.AddReg
+
+[EmuKs.Topology.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%EmuKs.TopologyName%
+
+; The panel does not use a PDO audio interface: it opens the driver-owned
+; \\.\EmuUSBAudioCtl control device instead (contract in Emu/emu_ioctl.h).
 
 [Emu0404.Install.Services]
 AddService = EmuUSBAudio,0x00000002,EmuKs.Service
@@ -68,16 +80,20 @@ ServiceBinary = %12%\emuusbaudio.sys
 
 [EmuKs.AddReg]
 HKR,,Driver,,emuusbaudio.sys
-; No AssociatedFilters on purpose: wdmaud/swmidi/redbook attach to the FDO and
-; look for KS filters, and M1 registers none (no PcRegisterSubdevice), so their
-; presence would mix other drivers' failures into the PnP soak. They come back
-; in M4 together with WDMAUDIO.Registration.
+HKR,,AssociatedFilters,,"wdmaud"
+HKR,Drivers,SubClasses,,"wave,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%Emu0404.DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%Emu0404.DeviceDesc%
 
 [EmuKs.HwAddReg]
 ; FILE_DEVICE_SOUND
 HKR,,DeviceType,0x10001,0x0000001D
-; SDDL_DEVOBJ_SYS_ALL_ADM_ALL
-HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)"
+; Match the stock usbaudio2/hdaudio audio-device ACL. Windows Audio runs as a
+; service, not as the elevated client, and must be able to open the KS filter.
+; The separate \\.\EmuUSBAudioCtl control device remains admin-only.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 
 [Strings]
 ProviderName    = "openEMUdriver project"
@@ -85,6 +101,13 @@ MfgName         = "openEMUdriver project"
 DiskName        = "EmuUSBAudio Installation Disk"
 Emu0404.DeviceDesc = "E-MU 0404 USB (openEMUdriver kernel)"
 EmuKs.SvcDesc   = "EmuUSBAudio - openEMUdriver kernel transport"
+Proxy.CLSID     = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO  = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSNAME_WaveEmuRender = "WaveEmuRender"
+KSNAME_TopologyEmuRender = "TopologyEmuRender"
+EmuKs.WaveName = "E-MU 0404 USB Render (openEMUdriver)"
+EmuKs.TopologyName = "E-MU 0404 USB Topology (openEMUdriver)"
 ; The panel-visible control device name is \\.\EmuUSBAudioCtl (stage 4c); its
 ; class GUID lives in driver/emuusbaudio/Emu/emu_ioctl.h, which the panel
 ; compiles too.

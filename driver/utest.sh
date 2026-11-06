@@ -3,9 +3,10 @@
 #
 #   utest.sh                  build and run every test
 #   utest.sh -n               build only, do not run
-#   utest.sh desc ctrl state ioctl   only the named units
+#   utest.sh desc ctrl state ioctl isoch audio   only the named units
 #                  (desc = parser, ctrl = EP0 requests, state = settings cache,
-#                   ioctl = the panel contract)
+#                   ioctl = panel contract, isoch = scheduling, audio = M4 format
+#                   conversion and WaveRT ring/position arithmetic)
 #
 # Per unit, two things are proven, in this order:
 #   1. the source compiles with the exact kernel flags kbuild.sh uses, so the
@@ -39,11 +40,11 @@ err() { echo "utest: $*" >&2; exit 1; }
 for a in "$@"; do
     case "$a" in
         -n) RUN=0 ;;
-        desc|ctrl|state|ioctl|isoch) WANT="$WANT $a" ;;
+        desc|ctrl|state|ioctl|isoch|audio) WANT="$WANT $a" ;;
         *) err "unknown argument: $a" ;;
     esac
 done
-[ -n "$WANT" ] || WANT="desc ctrl state ioctl isoch"
+[ -n "$WANT" ] || WANT="desc ctrl state ioctl isoch audio"
 
 . "$SCRIPT_DIR/toolfound.sh"
 
@@ -59,6 +60,7 @@ src_for() {
         state) echo "$DRV/Emu/emu_state.cpp $DRV/Emu/emu_desc.cpp" ;;
         ioctl) echo "$DRV/Emu/emu_ioctl.cpp $DRV/Emu/emu_desc.cpp $DRV/Emu/emu_state.cpp" ;;
         isoch) echo "$DRV/Emu/emu_isoch.cpp" ;;
+        audio) echo "$DRV/Emu/emu_audio.cpp" ;;
     esac
 }
 test_for() { echo "$SCRIPT_DIR/tests/emu_$1test.cpp"; }

@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   kinstall.ps1 [-Build] [-Uninstall] [-Rollback] [-Sys <path>] [-Inf <path>]
 
@@ -158,7 +158,9 @@ if ($Build) {
             emuusbaudio/Emu/emu_disp.cpp `
             emuusbaudio/Emu/emu_usb.cpp emuusbaudio/Emu/emu_desc.cpp `
             emuusbaudio/Emu/emu_ctrl.cpp emuusbaudio/Emu/emu_state.cpp `
-            emuusbaudio/Emu/emu_ioctl.cpp emuusbaudio/Emu/emu_isoch.cpp
+            emuusbaudio/Emu/emu_ioctl.cpp emuusbaudio/Emu/emu_isoch.cpp `
+            emuusbaudio/Emu/emu_audio.cpp emuusbaudio/Emu/emu_wave.cpp `
+            emuusbaudio/Emu/emu_newdelete.cpp
         if ($LASTEXITCODE -ne 0) { throw "kbuild.sh failed" }
     } finally { Pop-Location }
 }
@@ -215,9 +217,22 @@ if (-not $dev) { Write-Warning "0404 not present: the package is installed but t
 # to map the fresh binary. Hence: remove the devnode, stop the service,
 # delete the old imports, add the fresh package, scan - the re-enumerated
 # devnode binds and loads the new image.
+$rebootRequired = $false
 if ($dev) { pnputil /remove-device $dev.InstanceId | Out-Null }
 sc.exe stop EmuUSBAudio | Out-Null
-Start-Sleep -Seconds 2
+$service = Get-Service EmuUSBAudio -ErrorAction SilentlyContinue
+for ($i = 0; $i -lt 20 -and $service -and
+     $service.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped; $i++) {
+    Start-Sleep -Milliseconds 500
+    $service = Get-Service EmuUSBAudio -ErrorAction SilentlyContinue
+}
+if ($service -and
+    $service.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped) {
+    # The new file can already be in System32\drivers while the old image is
+    # still mapped. Re-enumerating the devnode does not replace that image.
+    $rebootRequired = $true
+    Write-Warning "EmuUSBAudio did not unload; a reboot is required before the new image can run."
+}
 Remove-OemPackage 'openemu-ks.inf'
 
 pnputil /add-driver $stagedInf /install
@@ -226,8 +241,12 @@ pnputil /scan-devices | Out-Null
 Start-Sleep -Seconds 2
 Show-Result
 
-Write-Host @"
+if ($rebootRequired) {
+    Write-Warning "Package installation is complete, but the old driver is still running. Reboot before any WASAPI or soak test."
+} else {
+    Write-Host @"
 
 Next: the M1 acceptance run (50 disable/enable + remove/replug cycles under
 Driver Verifier) - driver/ksoak.ps1. Verifier and reboot are not touched here.
 "@
+}

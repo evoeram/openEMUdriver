@@ -1,4 +1,4 @@
-﻿// EmuUSBAudio driver entry.
+// EmuUSBAudio driver entry.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // initguid first: the contract header's DEFINE_GUID becomes the one
 // definition in this translation unit, because IoCreateDeviceSecure below
@@ -141,7 +141,7 @@ extern "C" NTSTATUS DriverEntry(
         EmuDriverRegistryPath.MaximumLength =
             (USHORT)sizeof(g_RegistryPathBuffer);
         EmuDriverRegistryPath.Buffer = g_RegistryPathBuffer;
-        EmuNoteStatusValue(NULL, L"EntryBread", 0x00000018);
+        EmuNoteStatusValue(NULL, L"EntryBread", 0x0000001D);
     }
     EmuReadTraceLevel(RegistryPath);
 
@@ -176,7 +176,8 @@ extern "C" NTSTATUS DriverEntry(
     // name; hardware run 2026-11-04), so the PDO-registered interface could
     // never be opened - this named device object is the panel way in
     // instead. Admin-only, one per driver; the multi-instance name story is
-    // M9's. Security matches the INF's FDO line (SYS_ALL_ADM_ALL).
+    // M9's. This private control ACL is deliberately stricter than the audio
+    // FDO ACL in the INF, which must also admit the Windows Audio service.
     UNICODE_STRING ctlName, ctlDosName, ctlSddl;
     RtlInitUnicodeString(&ctlName, L"\\Device\\EmuUSBAudioCtl");
     RtlInitUnicodeString(&ctlDosName, L"\\??\\EmuUSBAudioCtl");

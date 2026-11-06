@@ -1,6 +1,6 @@
-// wasapi-test — enumerate WASAPI endpoints; optionally play a 2 s 440 Hz tone
-//   wasapi-test            list endpoints
-//   wasapi-test -p <idx>   play tone through endpoint <idx>
+// wasapi-test — enumerate WASAPI render endpoints; optionally play a 2 s tone
+//   wasapi-test            list render endpoints
+//   wasapi-test -p <idx>   play 440 Hz through render endpoint <idx>
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -23,10 +23,10 @@ int wmain(int argc, wchar_t** argv) {
     int target = play ? _wtoi(argv[2]) : -1;
 
     IMMDeviceCollection* coll = nullptr;
-    hr = en->EnumAudioEndpoints(play ? eRender : eAll, DEVICE_STATE_ACTIVE, &coll);
+    hr = en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll);
     if (FAILED(hr)) { printf("enum hr=0x%08lX\n", hr); return 1; }
     UINT n = 0; coll->GetCount(&n);
-    printf("WASAPI %s endpoints: %u\n", play ? "render" : "active", n);
+    printf("WASAPI render endpoints: %u\n", n);
 
     int emuIdx = -1;
     for (UINT i = 0; i < n; i++) {
