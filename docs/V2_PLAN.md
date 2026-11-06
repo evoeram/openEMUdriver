@@ -1282,6 +1282,47 @@ SET_RATE и USB START ещё не вызывались. В INF оставалс�
 подписаны. Установка .28 и повторный WASAPI START ещё не выполнялись; вердикт
 о ring/positions по-прежнему впереди.
 
+### M4, первый железный прогон 2.0.0.28 (2026-11-06, отчёт)
+
+Подтверждено `EntryBread=0x1D` — 2.0.0.28 загружен, и `GetMixFormat` на
+endpoint [3] больше не возвращает `E_ACCESSDENIED`: воспроизвёлся сценарий,
+который падал на .27, дальше property-запроса дело дошло. Однако отчёт НЕ
+доказывает ни наличие, ни работоспособность нашего render endpoint'а:
+
+* endpoint [3] сообщил mix format **44100 Hz, 2 ch**. Единственный формат
+  miniport'а — 48000 Hz stereo 24-in-32, поэтому [3] не может быть endpoint'ом
+  openEMUdriver. Тон «проигрывался» через чужое устройство.
+* В активном списке 5 render endpoints: [0] Realtek Digital Output,
+  [1] (имя пустое), [2] MONITOR (NVIDIA), [3] и [4] (имена пустые). Совпадений
+  по «E-MU»/«0404» нет ни в именах, ни в desc — при пустых именах индексы
+  ненадёжны, и идентификация «index 3 = E-MU» от прогона .27 считается
+  **ошибочной** (имя не проверялось, mix format не запрашивался).
+* `WaveStartStatus` в реестре отсутствует; `emu-probe test-stats`: rate 0,
+  render/capture running 0, submits/completes/bytes = 0 — `EmuIsochStartRender`
+  не вызывался. Для чужого endpoint'а это ожидаемо; для нашего — тоже норма,
+  если он не ACTIVE либо не был выбран.
+* Тестовый probe до этой правки не проверял HR от `Start()`/`Stop()` и печатал
+  «done» безусловно, перечислял только ACTIVE endpoints и не печатал id/desc —
+  то есть не позволял отличить «наш endpoint молча не стартовал» от «выбран не
+  тот endpoint».
+
+Правки в `tools/wasapi-test.cpp`: перечисление ВСЕХ состояний
+(ACTIVE/DISABLED/NOTPRESENT/UNPLUGGED), печать endpoint id, `DeviceDesc`,
+friendly name, probe `GetMixFormat` в list-режиме (без создания стрима), явная
+отметка 48 kHz-кандидатов, проверка и вывод HR от `Initialize`/`GetBuffer`/
+`Start`/`Stop`, предупреждение при mix != 48000 Hz, подсказка с командами
+проверки (`emu-probe test-stats`, `reg query ... /v WaveStartStatus`).
+`bin/wasapi-test.exe` в репозитории не пересобран (нет MinGW в этом
+окружении) — пересборка: `./build.sh` на машине разработчика.
+
+Следующий шаг (тот же, но теперь детерминированный): пересобрать probe,
+найти наш endpoint именно по 48000 Hz stereo (либо `Get-PnpDevice -Class
+AudioEndpoint`), при необходимости включить его в Sound control panel или
+переустановить devnode, проиграть тон через `-p <idx>`, затем снять
+`emu-probe test-stats` (ожидание: rate 48000, running 1, submits/completes
+растут, urb-fail/pkt-err = 0) и `WaveStartStatus` (ожидание 0). Вердикт о
+ring/positions по-прежнему не получен.
+
 ## Тесты (обязательные)
 
 1. Parser: реальные дескрипторы всех моделей, malformed lengths, лишние
