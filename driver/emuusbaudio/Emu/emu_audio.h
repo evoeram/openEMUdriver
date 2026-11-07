@@ -22,6 +22,10 @@
 #define EMU_AUDIO_M4_CHANNELS         2
 #define EMU_AUDIO_HOST_SAMPLE_BYTES   4
 #define EMU_AUDIO_USB_SAMPLE_BYTES    3
+/* The pin data range must advertise the VALID bit depth: PortCls's generic
+ * data intersection derives the container from it, and a 32/32 range yields
+ * a plain 32-bit integer WAVE_FORMAT_PCM the audio engine cannot convert. */
+#define EMU_AUDIO_M4_VALID_BITS       24
 
 ULONG
 EmuAudioHostFrameBytes(

@@ -84,7 +84,10 @@ private:
     ULONGLONG m_NextNotificationFrame;
     LIST_ENTRY m_NotificationList;
     KSPIN_LOCK m_NotificationLock;
-    ULONG m_LastOsWritePacket;
+    // Absolute ring-packet index the OS has last claimed written (wrap-aware
+    // reconstruction of the cyclic SetWritePacket argument). The ISO worker
+    // gates packet submission on it.
+    ULONGLONG m_LastOsWriteAbs;
 
 public:
     DECLARE_STD_UNKNOWN();
@@ -114,6 +117,7 @@ public:
 
 private:
     ULONGLONG TotalCompletedFrames();
+    ULONGLONG TotalSubmittedFrames();
     NTSTATUS AllocateBuffer(
         _In_ ULONG NotificationCount,
         _In_ ULONG RequestedSize,

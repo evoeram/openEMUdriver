@@ -1323,6 +1323,91 @@ AudioEndpoint`), при необходимости включить его в So
 растут, urb-fail/pkt-err = 0) и `WaveStartStatus` (ожидание 0). Вердикт о
 ring/positions по-прежнему не получен.
 
+### M4, железный прогон 2.0.0.30–.32 (2026-11-06, вечер): WASAPI-гейт закрыт
+
+Утренний блок смягчили две пробы: новый `bin/wasapi-test.exe` (list-режим с
+id/state/mix по всем состояниям) опознал наш endpoint по id против
+`Get-PnpDevice -Class AudioEndpoint`, а новый `tools/ks-probe.exe` (KS-свойства
+пина из user mode, admin не нужен — KS-фильтр открыт Everyone по ACL INF)
+показал, что `PROPOSEDATAFORMAT(2)` из user mode даёт `ERROR_NOT_FOUND` и на
+эталонном hdaudio — это норма, а двигается формат через `DATAINTERSECTION`.
+
+Корневой баг (три слоя, найдены сравнением с hdaudio.sys):
+
+1. `g_EmuWaveStreamRange` объявлял 32/32 бита: generic-intersection PortCls
+   выдавал plain `WAVE_FORMAT_PCM` 32-bit int, который движок не конвертирует.
+   Фикс: в range — валидные биты (`EMU_AUDIO_M4_VALID_BITS=24`).
+2. `DataRangeIntersection` = `STATUS_NOT_IMPLEMENTED` (паттерн sysvad)
+   недостаточен для 24-in-32: generic-fallback пакует 24 бита в 6 байт/фрейм,
+   движок и это не принимает. Фикс: свой intersection, возвращающий точный
+   `g_EmuWaveFormat` (extensible 32-контейнер/24-valid) для клиентов
+   PCM/WILDCARD/**IEEE_FLOAT** (mix-конвейер движка float) на 48000/2.
+3. Size-query: portcls спрашивает размер при `ResultantFormat=NULL, len=0`,
+   наш NULL-чек отвечал `INVALID_PARAMETER` раньше ветки
+   `STATUS_BUFFER_OVERFLOW` — формат никогда не доходил до audiosdg
+   (`PKEY_AudioEngine_DeviceFormat` не записывался). Фикс: NULL-буфер
+   валиден только при len=0 (семантика sysvad).
+
+Диагностика велась хлебными крошками `DriCalls/DriLastClientSub/
+DriLastClientCh/DriLastStatus` и `PropCalls/PropLastId/PropLastStatus`
+(запись через `EmuNoteStatusValue` из обработчиков) — 0xC000000D на size-query
+и шквал `STATUS_NO_MATCH` по float-предложениям указали на оба слоя. Крошки
+временно, убрать в чистой сборке. Попутно: `EmuNoteStatusValue` теперь
+`ZwCreateKey` (чистая переустановка пакета пересоздаёт service key без
+`Parameters`, хлебные крошки молча терялись); `EntryBread` .32 = 0x22.
+
+Вердикт (2.0.0.32, EntryBread=0x22): endpoint отдаёт mix **48000 Hz 2ch
+float**, `wasapi-test -p <idx>` проиграл тон (Initialize/GetBuffer/Start/Stop
+OK), `test-stats`: render **submits 6 244 817 = completes 6 244 817**,
+urb-fail/pkt-err/short = 0, чистый stop; **`WaveStartStatus = 0x0`** — ожидание
+чеклиста выполнено. Ring/positions — следующий слой (пока shared/event-driven
+без позиционного дрейфа, замер дрейфа не делался).
+
+Известные хвосты: endpoint MMDEVAPI меняет GUID каждый ребут (граф
+пересоздаётся); INF `DriverVer` всё ещё 2.0.0.28 (обновить при следующем
+пакете); инструменты `ks-probe.c` добавлены в `tools/`, `wasapi-test.cpp`
+правлен; смена образа драйвера без ребута не удаётся (`EmuUSBAudioCtl` живёт
+с DriverEntry до DriverUnload) — всегда ребут после `kinstall.ps1`.
+
+### M4, вердикт на 2.0.0.40 (2026-11-07): WASAPI-тон прошёл, счётчики
+идеальны; перед установкой пойман рецидив self-deadlock
+
+Слой между .32 и .40: SET стриминговой частоты внутри старта рендера
+(`RateSetEnter`/`StreamRateSet` — DAC тактируется XU-регистром, молчаливый
+выход при чужой частоте), доступ `EmuIsochRenderSubmittedFrames`, свой
+`DataRangeIntersection` (IEEE_FLOAT → точный формат 48k/2/24-in-32),
+fill-probe/underrun-диагностика волны, **3-секундный таймаут с отменой** в
+`EmuUsbSubmitUrb` (утреннее зависание: SET_CUR часовому юниту не завершился,
+синхронное ожидание было вечным) и `ZwCreateKey` в `EmuNoteStatusValue`
+(чистая переустановка пересоздаёт service key без Parameters — крошки
+терялись).
+
+**Рецидив 2.0.0.24 пойман на ревью перед железом**: в новом блоке rate-set
+в `EmuIsochStartRender` первым вызовом стоял простой `EmuUsbExecuteSet` —
+под `StateLock`, который держит волна-старт: повторное приобретение fast
+mutex = вечное ожидание самого себя. Убран, оставлен `EmuUsbExecuteSetLocked`
+(+ комментарий-инвариант); отказ SET теперь громко валит старт, а не
+продолжает с неизвестной частотой устройства.
+
+Установка: `kbuild.sh` начинался с UTF-8 BOM — Git Bash его стерпел, а баш,
+запущенный из `kinstall.ps1 -Build`, нет (`я╗┐#!/bin/bash` = не shebang);
+BOM снят. Inf2Cat отверг `DriverVer = 11/07` при локальных 02:xx — сравнение
+по UTC; брать дату не впереди UTC-сегодняшнего дня.
+
+**Железный вердикт (11:13, `EntryBread = 0x28`):** после загрузки старт уже
+прошёл автоматически — `RateSetEnter=1`, `StreamRateSet=0`, `WaveStartStatus=0`.
+`wasapi-test -p 12` (endpoint по имени «E-MU 0404 USB (openEMUdriver
+kernel)», 440 Hz, 2 с) — `exit=0`. Счётчики рендера t0→t1:
+submits 464 470 → 1 056 913, **completes = submits в обеих точках** (дельта
++592 443 без расхождений), urb-fail/pkt-err/short = 0, чистый stop, оба
+направления idle, capture не тронут (0). BSOD/зависаний нет. M4-гейт
+WASAPI-тона закрыт на новом слое.
+
+Факт загрузки образа: PnP грузит пакет **из DriverStore** — в
+`C:\Windows\System32\drivers\emuusbaudio.sys` оставалась устаревшая копия
+при работающем новом образе. Верификация установки — по DriverStore-копии и
+`EntryBread`, не по хэшу SYS32.
+
 ## Тесты (обязательные)
 
 1. Parser: реальные дескрипторы всех моделей, malformed lengths, лишние

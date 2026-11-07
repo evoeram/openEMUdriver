@@ -64,8 +64,8 @@ static KSDATARANGE_AUDIO g_EmuWaveStreamRange =
         STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
     },
     EMU_AUDIO_M4_CHANNELS,
-    32,
-    32,
+    EMU_AUDIO_M4_VALID_BITS,
+    EMU_AUDIO_M4_VALID_BITS,
     EMU_AUDIO_M4_RATE_HZ,
     EMU_AUDIO_M4_RATE_HZ
 };
@@ -421,7 +421,7 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveMiniport::GetDescription(
 }
 
 #pragma code_seg("PAGE")
-STDMETHODIMP_(NTSTATUS) CEmuWaveMiniport::DataRangeIntersection(
+static NTSTATUS EmuWaveDataRangeIntersectionBody(
     _In_ ULONG PinId,
     _In_ PKSDATARANGE ClientDataRange,
     _In_ PKSDATARANGE MyDataRange,
@@ -434,12 +434,115 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveMiniport::DataRangeIntersection(
     PAGED_CODE();
 
     UNREFERENCED_PARAMETER(PinId);
-    UNREFERENCED_PARAMETER(ClientDataRange);
     UNREFERENCED_PARAMETER(MyDataRange);
-    UNREFERENCED_PARAMETER(OutputBufferLength);
-    UNREFERENCED_PARAMETER(ResultantFormat);
-    UNREFERENCED_PARAMETER(ResultantFormatLength);
-    return STATUS_NOT_IMPLEMENTED;
+
+    if (ResultantFormatLength == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *ResultantFormatLength = 0;
+
+    // The generic PortCls intersection builds a plain packed WAVEFORMATEX out
+    // of the data range, and the audio engine has no float->packed-24 or
+    // float->int-32 converter, so an intersection that defers to it leaves the
+    // endpoint without a mix format (GetMixFormat = AUDCLNT_E_UNSUPPORTED_
+    // FORMAT). Return the exact 24-in-32 device format instead, like the
+    // in-box HDAudio miniport does.
+    if (!IsEqualGUIDAligned(ClientDataRange->Specifier,
+                            KSDATAFORMAT_SPECIFIER_WAVEFORMATEX) &&
+        !IsEqualGUIDAligned(ClientDataRange->Specifier,
+                            KSDATAFORMAT_SPECIFIER_WILDCARD)) {
+        return STATUS_NO_MATCH;
+    }
+    // The engine probes the intersection with float32 client ranges (its mix
+    // pipeline is float); answering NO_MATCH to those defers to the generic
+    // PortCls intersection, whose packed-PCM result the engine cannot use.
+    // Accept float clients and return the closest device format, like the
+    // in-box HDAudio miniport does.
+    if (!IsEqualGUIDAligned(ClientDataRange->SubFormat,
+                            KSDATAFORMAT_SUBTYPE_WILDCARD) &&
+        !IsEqualGUIDAligned(ClientDataRange->SubFormat,
+                            KSDATAFORMAT_SUBTYPE_PCM) &&
+        !IsEqualGUIDAligned(ClientDataRange->SubFormat,
+                            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
+        return STATUS_NO_MATCH;
+    }
+    if (ClientDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
+        PKSDATARANGE_AUDIO client = (PKSDATARANGE_AUDIO)ClientDataRange;
+        if (client->MaximumChannels != 0xFFFFFFFF &&
+            client->MaximumChannels < EMU_AUDIO_M4_CHANNELS) {
+            return STATUS_NO_MATCH;
+        }
+        if (client->MinimumSampleFrequency > EMU_AUDIO_M4_RATE_HZ ||
+            client->MaximumSampleFrequency < EMU_AUDIO_M4_RATE_HZ) {
+            return STATUS_NO_MATCH;
+        }
+    }
+
+    ULONG required = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
+    *ResultantFormatLength = required;
+    if (OutputBufferLength == 0) {
+        // Size query: ResultantFormat may legitimately be NULL here.
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    if (ResultantFormat == NULL || OutputBufferLength < required) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    RtlCopyMemory(ResultantFormat, &g_EmuWaveFormat, required);
+    return STATUS_SUCCESS;
+}
+
+// Diagnostics for the M4 format-acquisition gate: the ISO transport is proven,
+// so if the endpoint still has no mix format these breadcrumbs show whether
+// the audio stack reaches the intersection at all, with which client ranges,
+// and what we answer.
+static ULONG g_DriCalls;
+static ULONG g_DriLastClientSub;
+static ULONG g_DriLastClientCh;
+static ULONG g_DriLastStatus;
+
+// Silence probe: what actually left the host in the first packet after RUN.
+// Armed by SetState(KSSTATE_RUN) (PASSIVE), sampled by FillUsbPacket
+// (DISPATCH_LEVEL), flushed to the registry by GetPosition (PASSIVE).
+static volatile LONG g_FillProbeArmed;
+static volatile LONG g_FillProbeDirty;
+static ULONG g_FillNonZero;
+static ULONG g_FillSig0;
+static ULONG g_FillSig1;
+static ULONG g_Underruns;
+
+#pragma code_seg("PAGE")
+STDMETHODIMP_(NTSTATUS) CEmuWaveMiniport::DataRangeIntersection(
+    _In_ ULONG PinId,
+    _In_ PKSDATARANGE ClientDataRange,
+    _In_ PKSDATARANGE MyDataRange,
+    _In_ ULONG OutputBufferLength,
+    _Out_writes_bytes_to_opt_(OutputBufferLength, *ResultantFormatLength)
+        PVOID ResultantFormat,
+    _Out_ PULONG ResultantFormatLength
+    )
+{
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    status = EmuWaveDataRangeIntersectionBody(PinId, ClientDataRange,
+                                              MyDataRange, OutputBufferLength,
+                                              ResultantFormat,
+                                              ResultantFormatLength);
+    g_DriCalls++;
+    g_DriLastClientSub = (ClientDataRange != NULL)
+                             ? ClientDataRange->SubFormat.Data1 : 0;
+    g_DriLastClientCh =
+        (ClientDataRange != NULL &&
+         ClientDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO))
+            ? ((PKSDATARANGE_AUDIO)ClientDataRange)->MaximumChannels
+            : 0xFFFFFFFF;
+    g_DriLastStatus = (ULONG)status;
+    EmuNoteStatusValue(NULL, L"DriCalls", g_DriCalls);
+    EmuNoteStatusValue(NULL, L"DriLastClientSub", g_DriLastClientSub);
+    EmuNoteStatusValue(NULL, L"DriLastClientCh", g_DriLastClientCh);
+    EmuNoteStatusValue(NULL, L"DriLastStatus", g_DriLastStatus);
+    return status;
 }
 
 #pragma code_seg("PAGE")
@@ -633,6 +736,9 @@ static NTSTATUS EmuWaveFilterProperty(_In_ PPCPROPERTY_REQUEST Request)
 {
     CEmuWaveMiniport* miniport;
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+    static ULONG s_PropCalls;
+    static ULONG s_PropLastId;
+    static ULONG s_PropLastStatus;
 
     PAGED_CODE();
 
@@ -649,6 +755,12 @@ static NTSTATUS EmuWaveFilterProperty(_In_ PPCPROPERTY_REQUEST Request)
         }
     }
     miniport->Release();
+    s_PropCalls++;
+    s_PropLastId = Request->PropertyItem->Id;
+    s_PropLastStatus = (ULONG)status;
+    EmuNoteStatusValue(NULL, L"PropCalls", s_PropCalls);
+    EmuNoteStatusValue(NULL, L"PropLastId", s_PropLastId);
+    EmuNoteStatusValue(NULL, L"PropLastStatus", s_PropLastStatus);
     return status;
 }
 
@@ -745,7 +857,7 @@ CEmuWaveStream::CEmuWaveStream(_In_opt_ PUNKNOWN Outer)
       m_State(KSSTATE_STOP),
       m_BaseFrames(0),
       m_NextNotificationFrame(0),
-      m_LastOsWritePacket(MAXULONG)
+      m_LastOsWriteAbs(0)
 {
     InitializeListHead(&m_NotificationList);
     KeInitializeSpinLock(&m_NotificationLock);
@@ -1089,6 +1201,19 @@ ULONGLONG CEmuWaveStream::TotalCompletedFrames()
 }
 
 #pragma code_seg()
+ULONGLONG CEmuWaveStream::TotalSubmittedFrames()
+{
+    // Frames handed to the USB wire (packed), completed or still in flight.
+    // The packet model reports this to the OS: the engine must fill the ring
+    // ahead of the CONSUMED cursor, or the 4-slot pipeline reads packets the
+    // engine has not written yet.
+    if (m_Context->Isoch[EMU_STREAM_RENDER].Active) {
+        return m_BaseFrames + EmuIsochRenderSubmittedFrames(m_Context);
+    }
+    return m_BaseFrames;
+}
+
+#pragma code_seg()
 STDMETHODIMP_(NTSTATUS) CEmuWaveStream::GetPosition(
     _Out_ KSAUDIO_POSITION* Position
     )
@@ -1110,7 +1235,23 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::GetPosition(
         return STATUS_INVALID_DEVICE_STATE;
     }
     Position->PlayOffset = ring;
+    // WriteOffset = the CONSUMED cursor: the engine must fill the ring beyond
+    // the ISO pipeline's read cursor, not beyond the play cursor.
+    if (!EmuAudioPositions(TotalSubmittedFrames(), m_BufferBytes,
+                           EMU_AUDIO_M4_CHANNELS * EMU_AUDIO_HOST_SAMPLE_BYTES,
+                           &linear, &ring)) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     Position->WriteOffset = ring;
+
+    // Flush the silence probe (PASSIVE): what left the host in the first
+    // packet after the last RUN transition.
+    if (InterlockedCompareExchange(&g_FillProbeDirty, 0, 1) == 1) {
+        EmuNoteStatusValue(NULL, L"FillNonZero", g_FillNonZero);
+        EmuNoteStatusValue(NULL, L"FillSig0", g_FillSig0);
+        EmuNoteStatusValue(NULL, L"FillSig1", g_FillSig1);
+    }
+    EmuNoteStatusValue(NULL, L"Underruns", g_Underruns);
     return STATUS_SUCCESS;
 }
 
@@ -1121,8 +1262,8 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetWritePacket(
     _In_ ULONG EosPacketLength
     )
 {
-    ULONG currentPacket;
-    ULONG expectedPacket;
+    LONG submittedAbs;
+    LONG ahead;
     LONG delta;
 
     UNREFERENCED_PARAMETER(EosPacketLength);
@@ -1136,16 +1277,37 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetWritePacket(
     if (m_State != KSSTATE_RUN && m_State != KSSTATE_PAUSE) {
         return STATUS_INVALID_DEVICE_STATE;
     }
-    currentPacket = (ULONG)(TotalCompletedFrames() / m_NotificationFrames);
-    expectedPacket = currentPacket + (m_State == KSSTATE_RUN ? 1 : 0);
-    delta = (LONG)(PacketNumber - expectedPacket);
+    // The OS passes the cyclic ring-packet index; reconstruct the absolute
+    // packet index by unwrapping forward from the last accepted one.
+    submittedAbs = (LONG)(TotalSubmittedFrames() / m_NotificationFrames);
+    delta = (LONG)((ULONG)m_LastOsWriteAbs % m_NotificationCount);
+    delta = (LONG)PacketNumber - delta;
     if (delta < 0) {
+        delta += (LONG)m_NotificationCount;   // cyclic wrap: forward only
+    }
+    // ahead = how far past the consumed cursor the OS claims to have written.
+    ahead = (LONG)(m_LastOsWriteAbs + (ULONGLONG)delta - submittedAbs);
+    if (ahead < 1) {
+        // The driver already consumed this packet: OS underrun.
         return STATUS_DATA_LATE_ERROR;
     }
-    if (delta > 0) {
+    if (ahead > EMU_ISOCH_SLOTS) {
+        // Beyond the pipeline: the data would never be read in order.
         return STATUS_DATA_OVERRUN;
     }
-    m_LastOsWritePacket = PacketNumber;
+    m_LastOsWriteAbs += (ULONGLONG)delta;
+
+    // Flush the silence probe here: the packet-model engine talks to the
+    // stream through Set/GetPacketCount and never calls the legacy
+    // GetPosition, so this is the regular PASSIVE_LEVEL callback.
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        if (InterlockedCompareExchange(&g_FillProbeDirty, 0, 1) == 1) {
+            EmuNoteStatusValue(NULL, L"FillNonZero", g_FillNonZero);
+            EmuNoteStatusValue(NULL, L"FillSig0", g_FillSig0);
+            EmuNoteStatusValue(NULL, L"FillSig1", g_FillSig1);
+        }
+        EmuNoteStatusValue(NULL, L"Underruns", g_Underruns);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1160,7 +1322,9 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::GetPacketCount(
     if (m_NotificationCount == 0) {
         return STATUS_NOT_SUPPORTED;
     }
-    *PacketCount = (ULONG)(TotalCompletedFrames() / m_NotificationFrames);
+    // The OS fills the ring ahead of the CONSUMED cursor, so it must learn
+    // the submitted count, not the completed one.
+    *PacketCount = (ULONG)(TotalSubmittedFrames() / m_NotificationFrames);
     return STATUS_SUCCESS;
 }
 
@@ -1199,8 +1363,8 @@ VOID CEmuWaveStream::StopAndReset()
     ExAcquireFastMutex(&m_Context->StateLock);
     EmuIsochStopRender(m_Context);
     m_BaseFrames = 0;
+    m_LastOsWriteAbs = 0;
     m_NextNotificationFrame = m_NotificationFrames;
-    m_LastOsWritePacket = MAXULONG;
     m_State = KSSTATE_STOP;
     ExReleaseFastMutex(&m_Context->StateLock);
 }
@@ -1212,13 +1376,14 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetState(_In_ KSSTATE State)
 
     PAGED_CODE();
 
+    EmuNoteStatusValue(m_Context, L"StateEnter", (ULONG)State);
     ExAcquireFastMutex(&m_Context->StateLock);
     switch (State) {
     case KSSTATE_STOP:
         EmuIsochStopRender(m_Context);
         m_BaseFrames = 0;
         m_NextNotificationFrame = m_NotificationFrames;
-        m_LastOsWritePacket = MAXULONG;
+        m_LastOsWriteAbs = 0;
         break;
 
     case KSSTATE_ACQUIRE:
@@ -1243,9 +1408,13 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetState(_In_ KSSTATE State)
                 status = STATUS_INVALID_DEVICE_STATE;
                 break;
             }
+            m_LastOsWriteAbs = 0;
             status = EmuIsochStartRender(
                 m_Context, EMU_AUDIO_M4_RATE_HZ, m_BaseFrames,
                 this, FillUsbPacket, UsbPacketCompleted);
+            if (NT_SUCCESS(status)) {
+                InterlockedExchange(&g_FillProbeArmed, 1);
+            }
         }
         break;
 
@@ -1296,6 +1465,49 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
         }
         Destination += spanFrames * EMU_AUDIO_M4_CHANNELS *
             EMU_AUDIO_USB_SAMPLE_BYTES;
+    }
+
+    // Data gate (packet model): do not put a packet on the wire before the OS
+    // has written it. The worker thread runs at PASSIVE_LEVEL, so a short
+    // bounded wait is allowed; a timeout is an OS underrun - the stale ring
+    // content goes out (a glitch), counted, instead of an eternal zero loop.
+    if (stream->m_NotificationCount != 0) {
+        ULONGLONG packetAbs = (LinearFramePosition - stream->m_BaseFrames) /
+            stream->m_NotificationFrames;
+        LARGE_INTEGER oneMs;
+        ULONG spin;
+
+        oneMs.QuadPart = -10000LL;
+        for (spin = 0; spin < 6; spin++) {
+            if (stream->m_LastOsWriteAbs >= packetAbs + 1) {
+                break;
+            }
+            KeDelayExecutionThread(KernelMode, FALSE, &oneMs);
+        }
+        if (stream->m_LastOsWriteAbs < packetAbs + 1) {
+            InterlockedIncrement((volatile LONG*)&g_Underruns);
+        }
+    }
+
+    // One-shot probe of the first packed packet after a RUN transition:
+    // nonzero-byte count and the first 8 packed bytes. Sampled here
+    // (DISPATCH_LEVEL), flushed to the registry from GetPosition (PASSIVE).
+    if (LinearFramePosition == stream->m_BaseFrames &&
+        InterlockedCompareExchange(&g_FillProbeArmed, 0, 1) == 1) {
+        PUCHAR packed = (PUCHAR)Destination -
+            Frames * EMU_AUDIO_M4_CHANNELS * EMU_AUDIO_USB_SAMPLE_BYTES;
+        ULONG nz = 0;
+        for (ULONG b = 0; b < Frames * 6; b++) {
+            if (packed[b] != 0) {
+                nz++;
+            }
+        }
+        g_FillNonZero = nz;
+        g_FillSig0 = (ULONG)packed[0] | ((ULONG)packed[1] << 8) |
+                     ((ULONG)packed[2] << 16) | ((ULONG)packed[3] << 24);
+        g_FillSig1 = (ULONG)packed[4] | ((ULONG)packed[5] << 8) |
+                     ((ULONG)packed[6] << 16) | ((ULONG)packed[7] << 24);
+        InterlockedExchange(&g_FillProbeDirty, 1);
     }
     return STATUS_SUCCESS;
 }

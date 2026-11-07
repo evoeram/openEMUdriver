@@ -510,6 +510,15 @@ EmuIsochRenderCompletedFrames(
         &Ctx->Isoch[EMU_STREAM_RENDER].CompletedFrames, 0, 0);
 }
 
+ULONGLONG
+EmuIsochRenderSubmittedFrames(
+    _In_ PEMU_DEVICE_CONTEXT Ctx
+    )
+{
+    return (ULONGLONG)InterlockedCompareExchange64(
+        &Ctx->Isoch[EMU_STREAM_RENDER].SubmittedFrames, 0, 0);
+}
+
 // Arm one direction: select the alternate, read the pipe facts out of the
 // submitted select-interface URB, build the slots, start the worker.
 static NTSTATUS
@@ -748,7 +757,19 @@ EmuIsochStartRender(
         return STATUS_NO_MATCH;
     }
 
+    // The device D/A clocks from the XU clock-rate register: the stock driver
+    // and v1 SET it before streaming, and a device left at another rate gates
+    // its output (silent DAC). The StartDevice probe only reads. Set the
+    // streaming rate on every start. The wave start path holds StateLock
+    // across EmuIsochStartRender, so this must be the Locked variant: the
+    // plain EmuUsbExecuteSet would re-acquire the caller's fast mutex and
+    // wait on itself forever - the 2.0.0.24 bug class, reintroduced here once
+    // already and caught before the 2.0.0.40 hardware run. A failed SET fails
+    // the start loudly: continuing with an unknown device rate can produce
+    // silently distorted audio instead.
+    EmuNoteStatusValue(Ctx, L"RateSetEnter", 1);
     status = EmuUsbExecuteSetLocked(Ctx, EmuIoctlSetRate, RateHz);
+    EmuNoteStatusValue(Ctx, L"StreamRateSet", (ULONG)status);
     if (!NT_SUCCESS(status)) {
         EmuNoteStatusValue(Ctx, L"WaveStartStatus", (ULONG)status);
         return status;

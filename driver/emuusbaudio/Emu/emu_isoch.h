@@ -47,10 +47,11 @@ typedef LONG NTSTATUS;
 // context. A forward declaration breaks the cycle; nothing here dereferences.
 typedef struct _EMU_DEVICE_CONTEXT EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
-// URBs in flight per direction. The plan's first slice names 6-8; 8 gives a
-// full millisecond of slack per slot at the 1 ms grid and matches the queue
-// depth v1 proved on this hardware.
-#define EMU_ISOCH_SLOTS              8
+// URBs in flight per direction. Four packets (16 ms) keep the wire covered
+// while staying inside the audio engine's write lookahead: the OS writes the
+// ring a few packets past the consumed cursor, and a deeper pipeline would
+// read packets the engine has not filled yet (silent output).
+#define EMU_ISOCH_SLOTS              4
 
 // StartFrame of the first packet: this many frames past the current frame
 // number, the reserve v1 used (the submission itself takes a few frames).
@@ -208,6 +209,11 @@ EmuIsochStopRender(
 
 ULONGLONG
 EmuIsochRenderCompletedFrames(
+    _In_ PEMU_DEVICE_CONTEXT Ctx
+    );
+
+ULONGLONG
+EmuIsochRenderSubmittedFrames(
     _In_ PEMU_DEVICE_CONTEXT Ctx
     );
 

@@ -80,9 +80,30 @@ EmuUsbSubmitUrb(
 
     status = IoCallDriver(Target, irp);
     if (status == STATUS_PENDING) {
-        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        // Bounded wait: a wedged device can NAK endpoint zero forever, and an
+        // unbounded wait here held the state lock and hung the whole start
+        // path (boot session 2026-11-07: SET_CUR on the clock unit never
+        // completed). Cancel and report the timeout instead.
+        LARGE_INTEGER timeout;
+        NTSTATUS wait;
+
+        timeout.QuadPart = -3 * 1000 * 10000LL;   // 3 s
+        wait = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE,
+                                     &timeout);
+        if (wait == STATUS_TIMEOUT) {
+            IoCancelIrp(irp);
+            wait = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE,
+                                         &timeout);
+            status = irp->IoStatus.Status;
+            if (NT_SUCCESS(status) || wait == STATUS_TIMEOUT) {
+                status = STATUS_IO_TIMEOUT;
+            }
+            EMU_LOG_WARN(STR_MODULENAME "URB timed out after 3 s, status 0x%x\n",
+                         status);
+        } else {
+            status = irp->IoStatus.Status;
+        }
     }
-    status = irp->IoStatus.Status;
     IoFreeIrp(irp);
     return status;
 }
@@ -421,7 +442,11 @@ EmuNoteStatusValue(
                                OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
                                NULL,
                                NULL);
-    if (!NT_SUCCESS(ZwOpenKey(&keyHandle, KEY_SET_VALUE, &objectAttributes))) {
+    // Create the key when it is missing: a clean package install rebuilds the
+    // service key without Parameters, and the open-only variant silently lost
+    // every breadcrumb until something else created the key (khw.ps1 did).
+    if (!NT_SUCCESS(ZwCreateKey(&keyHandle, KEY_SET_VALUE, &objectAttributes,
+                                0, NULL, REG_OPTION_NON_VOLATILE, NULL))) {
         return;
     }
     RtlInitUnicodeString(&valueName, Name);

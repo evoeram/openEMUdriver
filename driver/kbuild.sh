@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # Kernel build harness for the EmuUSBAudio PortCLS driver.
 #
 #   kbuild.sh <out.sys> <src...>          run from anywhere
