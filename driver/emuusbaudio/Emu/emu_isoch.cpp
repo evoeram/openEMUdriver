@@ -6,22 +6,39 @@
 // bounded loop that builds and submits URBs while a free slot exists and —
 // for render — the data behind the URB is already released by the OS. It is
 // called from the vendor's three event sites: data arrival (the WaveRT
-// SetWritePacket path), URB completion (DPC — the re-arm happens right there,
-// zero gap, no thread), and start/resume. One global StartFrame cursor per
-// stream advances +1 per URB and is re-anchored to the bus on every build
+// SetWritePacket path), URB completion (DPC — the data re-arm happens right
+// there, zero gap, no thread), and start/resume. One global StartFrame cursor
+// per stream advances +1 per URB and is re-anchored to the bus on every build
 // (cursor <= now -> now + 3, the vendor's invariant at 0x4DBE), so a stall of
 // any length re-anchors the schedule to the future instead of leaving slots
-// firing into the past. An URB without data behind it is never submitted: at
-// an empty ring the wire stays silent, exactly like the vendor's break at
-// 0x4A60, and the next build re-anchors when data arrives.
+// firing into the past. The anchor also clamps a cursor that leads the bus by
+// more than EMU_ISOCH_MAX_LEAD back to the present: the vendor's invariant
+// only corrects a cursor that fell BEHIND, and the 0x133 dump showed the
+// feedback loop marching its cursor ~66 h ahead of the bus while every
+// re-arm cycled inside one DPC. The feedback re-arm itself never resubmits
+// from inside its completion — the completion sets a 1 ms timer whose DPC
+// does the submit, so one DPC carries at most one feedback submission and
+// every cycle counter (the old FbRearmDepth) is gone. An URB without data
+// behind it is never submitted: at an empty ring the wire stays silent,
+// exactly like the vendor's break at 0x4A60, and the next build re-anchors
+// when data arrives.
+//
+// The engine is bounded fail-stop: the first URB-level contract break (submit
+// rejection, feedback failure, failed data URB) is recorded one-shot into
+// FailStage/FailStatus and sets Quit — the pump and the feedback slots stop
+// arming, StopStream performs the normal retire/drain/free. Per-packet
+// "missed service" statuses stay counted-only: they are the normal underrun
+// class, and the wire-side answer to them is the honest position advance in
+// EmuIsochHarvest (the device consumed the frame slots even when the packets
+// were silence), not a shutdown.
 //
 // The stop path is the load-bearing part: retire under the pump lock, abort
-// the pipes so every queued URB completes, wait for the Pending counter to
-// drain (each reap drains one), and only then free. Nothing is freed while an
-// IRP of this engine can still be running — the plan's rundown rule, obeyed
-// literally. A slot whose final completion never arrives is deliberately
-// retained rather than freed; the alternative is freeing memory an IRP still
-// references.
+// the pipes, cancel the owned IRPs the aborts cannot reach, wait for the
+// Pending counter to drain (each reap drains one), and only then free.
+// Nothing is freed while an IRP of this engine can still be running — the
+// plan's rundown rule, obeyed literally. A slot whose final completion never
+// arrives is deliberately retained rather than freed; the alternative is
+// freeing memory an IRP still references.
 #include "emu_isoch.h"
 
 // --- pure scheduling helpers -------------------------------------------------
@@ -88,10 +105,91 @@ EmuIsochSlotBytes(
     return want > MaxPacketSize ? want : MaxPacketSize;
 }
 
+LONG
+EmuIsochCursorAnchor(
+    _In_ ULONG  Now,
+    _Inout_ volatile ULONG *Cursor
+    )
+{
+    LONG lead = (LONG)(*Cursor - Now);
+
+    if (lead <= 0) {
+        // The vendor's invariant at 0x4DBE: a cursor that reached the present
+        // jumps to the future — a stall of any length is self-healing.
+        *Cursor = Now + EMU_ISOCH_FRAME_MARGIN;
+        return 1;
+    }
+    if (lead > (LONG)EMU_ISOCH_MAX_LEAD) {
+        // The half of the invariant the vendor never needed: a cursor that
+        // outran the bus (the feedback re-arm storm of the 0x133 dump) is
+        // clamped back to the present instead of scheduling further and
+        // further ahead.
+        *Cursor = Now + EMU_ISOCH_FRAME_MARGIN;
+        return 2;
+    }
+    return 0;
+}
+
+BOOLEAN
+EmuIsochFramesPerMsValid(
+    _In_ ULONG FramesPerMs
+    )
+{
+    return FramesPerMs >= 1 && FramesPerMs <= 16;
+}
+
+ULONG
+EmuIsochPickAltIndex(
+    _In_reads_(Count) const EMU_STREAM_ALT* Alts,
+    _In_ ULONG Count,
+    _In_ ULONG Direction,
+    _In_ ULONG Channels,
+    _In_ ULONG RateHz
+    )
+{
+    ULONG first = Count;
+    ULONG wanted = Count;
+    ULONG i;
+
+    for (i = 0; i < Count; i++) {
+        const EMU_STREAM_ALT* alt = &Alts[i];
+        BOOLEAN rate = FALSE;
+
+        if (alt->Direction != Direction || alt->Channels != Channels) {
+            continue;
+        }
+        // The rate check mirrors EmuAltSupportsRate (emu_desc.cpp); it is
+        // repeated here because the pure section links without emu_desc.cpp.
+        if (alt->RateFlags & EMU_ALT_CONTINUOUS_RATES) {
+            rate = (BOOLEAN)(RateHz >= alt->ContinuousMinHz &&
+                             RateHz <= alt->ContinuousMaxHz);
+        } else {
+            for (ULONG r = 0; r < alt->RateCount; r++) {
+                if (alt->Rates[r] == RateHz) {
+                    rate = TRUE;
+                    break;
+                }
+            }
+        }
+        if (!rate) {
+            continue;
+        }
+        if (first == Count) {
+            first = i;   // the descriptor-order first match (the old pick)
+        }
+        if (alt->DataInterval == EMU_ISOCH_DATA_BINTERVAL) {
+            wanted = i;  // the grid match: nothing better exists
+            break;
+        }
+    }
+    return wanted != Count ? wanted : first;
+}
+
 // --- engine ------------------------------------------------------------------
 
 #ifdef EMU_KERNEL
 #include "emu.h"
+#include <usbioctl.h>    // IOCTL_INTERNAL_USB_SUBMIT_URB
 #include <ntstrsafe.h>     // RtlStringCbPrintfW in the pipe-fact breadcrumbs
 
 static VOID
@@ -111,6 +209,40 @@ static VOID
 EmuIsochReleasePending(
     _Inout_ PEMU_ISOCH_STREAM S
     );
+
+// Bounded fail-stop: record the FIRST contract break and stop the stream from
+// arming anything new. Any IRQL (completions, timer DPC, pump): the verdict
+// is one-shot under the pump lock, the same lock the pump and the feedback
+// sites recheck their Quit under. Active is deliberately left set: StopStream
+// must still run its retire/drain/free over the stream, and clearing Active
+// here would make the stop path return early at its !S->Active gate. A break
+// discovered after the stop has already retired the stream (a canceled URB
+// completing with STATUS_CANCELLED, for instance) is a cancel artifact, not a
+// verdict, and records nothing.
+static VOID
+EmuIsochFailStop(
+    _Inout_ PEMU_ISOCH_STREAM S,
+    _In_ LONG                 Stage,
+    _In_ NTSTATUS             Status
+    )
+{
+    KIRQL oldIrql;
+
+    // Lock-free first check: the common no-op path (a verdict already stands)
+    // must not take the spinlock on every completion of a failed stream.
+    if (InterlockedCompareExchange(&S->FailStage, 0, 0) != EMU_ISOCH_FAIL_NONE) {
+        return;
+    }
+    KeAcquireSpinLock(&S->PumpLock, &oldIrql);
+    if (S->Quit != 0 || S->FailStage != EMU_ISOCH_FAIL_NONE) {
+        KeReleaseSpinLock(&S->PumpLock, oldIrql);
+        return;
+    }
+    S->FailStage = Stage;
+    S->FailStatus = (LONG)Status;
+    S->Quit = 1;
+    KeReleaseSpinLock(&S->PumpLock, oldIrql);
+}
 
 // The interrupt-time mapping of the bus frame: calibrated at start and
 // refreshed by every successful query, it is the anchor's source at
@@ -178,8 +310,9 @@ EmuIsochQueryFrameReal(
     KeClearEvent(&S->FrameEvent);
     stack = IoGetNextIrpStackLocation(irp);
     stack->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
-    // AssignUrbToIoStackLocation writes both the URB pointer and the
-    // IOCTL_INTERNAL_USB_SUBMIT_URB control code into the location. The
+    stack->Parameters.DeviceIoControl.IoControlCode = IOCTL_INTERNAL_USB_SUBMIT_URB;
+    // AssignUrbToIoStackLocation associates the URB; the IOCTL code must
+    // be set independently for the USB stack. The
     // classic (non-Ex) registration: the routine takes no locks, which is
     // legal at any IRQL, and the Ex variant's PASSIVE APC would bugcheck on
     // an inline completion (the 2.0.0.61 crash class).
@@ -188,22 +321,45 @@ EmuIsochQueryFrameReal(
 
     // Accounted like any armed URB: the completion drains it. A query that
     // goes pending past the wait below therefore keeps Pending raised, and
-    // the stop drain cannot free the IRP out from under the stack.
+    // the stop drain cannot free the IRP out from under the stack. The Idle
+    // latch is cleared on the 0 -> 1 step the same way every arm site does.
+    if (InterlockedCompareExchange(&S->Pending, 0, 0) == 0) {
+        KeClearEvent(&S->Idle);
+    }
     InterlockedIncrement(&S->Pending);
     status = IoCallDriver(Ctx->Pdo, irp);
     if (status == STATUS_PENDING) {
         wait.QuadPart = -100 * 10000LL;   // 100 ms bound
         if (KeWaitForSingleObject(&S->FrameEvent, Executive, KernelMode,
                                   FALSE, &wait) != STATUS_SUCCESS) {
-            // Still in flight; the completion releases FrameBusy when it
-            // runs. The mapping keeps carrying the anchor meanwhile.
+            // Still in flight: cancel and give the stack one bounded second
+            // to finish the cancellation. The old code left the query in
+            // flight here — Pending stayed raised until a completion that
+            // might never come, the stop drain timed out and the whole
+            // stream was retained (the floated-query wedge).
             InterlockedIncrement(&S->FqFloat);
-            return FALSE;
+            IoCancelIrp(irp);
+            wait.QuadPart = -1 * 1000 * 10000LL;
+            if (KeWaitForSingleObject(&S->FrameEvent, Executive, KernelMode,
+                                      FALSE, &wait) != STATUS_SUCCESS) {
+                // Even the cancel did not complete. The IRP stays accounted
+                // in Pending and FrameBusy stays set until the completion
+                // finally runs; the stop path cancels again. Nothing here
+                // touches the URB — the stack owns it until completion.
+                return FALSE;
+            }
         }
     }
-    if (!NT_SUCCESS(status)) {
-        // Completed inline with a failure; the completion has released the
-        // query. The mapping stays calibrated from earlier queries.
+
+    // The query's real verdict. IoCallDriver's status is stale once a floated
+    // query completed after the wait — STATUS_PENDING itself passes
+    // NT_SUCCESS, and the old code then fell into the success path and read a
+    // URB the stack had failed to fill, anchoring the whole mapping to a
+    // stale or zero frame number (the past-scheduling runaway class). Both
+    // the IRP and the URB status must say success before the answer moves the
+    // anchor.
+    if (!NT_SUCCESS(irp->IoStatus.Status) ||
+        !NT_SUCCESS((NTSTATUS)S->FrameUrb->UrbGetCurrentFrameNumber.Hdr.Status)) {
         InterlockedIncrement(&S->FqFail);
         return FALSE;
     }
@@ -253,11 +409,13 @@ EmuIsochFrameRefresh(
 }
 
 // Read one completed data URB into the counters. DPC-safe: interlocked
-// counters, the notification callback's spinlocks, no waits. A render frame
-// becomes visible to WaveRT only after its complete packet succeeded on the
-// wire; canceled, failed and short packets remain visible in the error
-// counters instead. The lengths are the actual transferred bytes — a short
-// fill went out as a short packet (the vendor's 0x4BBD) and shows up here.
+// counters, the notification callback's spinlocks, no waits. The render
+// position advances by the frames the wire actually carried on EVERY
+// completion — canceled, failed and short packets stay visible in the error
+// counters, but the frame slots they consumed are gone either way, and a
+// frozen position would strand the WaveRT notification handshake (the
+// reported hang). The lengths are the actual transferred bytes — a short fill
+// went out as a short packet (the vendor's 0x4BBD) and shows up here.
 static VOID
 EmuIsochHarvest(
     _Inout_ PEMU_ISOCH_STREAM S,
@@ -272,7 +430,6 @@ EmuIsochHarvest(
     ULONG p;
     BOOLEAN irpSuccess = NT_SUCCESS(Slot->Irp->IoStatus.Status);
     BOOLEAN urbSuccess = NT_SUCCESS((NTSTATUS)u->Hdr.Status);
-    BOOLEAN allPacketsOk = TRUE;
 
     InterlockedIncrement(&S->Completes);
 
@@ -281,13 +438,24 @@ EmuIsochHarvest(
         InterlockedExchange(&S->LastUrbStatus,
                             !irpSuccess ? (LONG)Slot->Irp->IoStatus.Status
                                         : (LONG)u->Hdr.Status);
+        // A URB-level failure is a contract break, not a wire condition; a
+        // run of them stops the stream (canceled completions at stop record
+        // nothing — FailStop checks Quit). One broken URB can be a stack
+        // hiccup; EMU_ISOCH_URB_FAIL_LIMIT in a row cannot.
+        if (InterlockedIncrement(&S->UrbConsecErrors) >=
+            EMU_ISOCH_URB_FAIL_LIMIT) {
+            EmuIsochFailStop(S, EMU_ISOCH_FAIL_URB,
+                             !irpSuccess ? Slot->Irp->IoStatus.Status
+                                         : (NTSTATUS)u->Hdr.Status);
+        }
+    } else {
+        InterlockedExchange(&S->UrbConsecErrors, 0);
     }
     for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
         if (!USBD_SUCCESS(u->IsoPacket[p].Status)) {
             InterlockedIncrement(&S->IsoPacketErrors);
             InterlockedExchange(&S->LastPacketStatus,
                                 (LONG)u->IsoPacket[p].Status);
-            allPacketsOk = FALSE;
         }
         got += u->IsoPacket[p].Length;
     }
@@ -296,12 +464,20 @@ EmuIsochHarvest(
     }
     InterlockedAdd(&S->Bytes, (LONG)got);
 
-    if (out && irpSuccess && urbSuccess && allPacketsOk &&
-        got == packetBytes) {
+    if (out) {
+        // The position advance is every completion, error or not: the device
+        // consumed the frame slots even when the packets were missed (it
+        // played silence), and a completion that froze the position froze the
+        // player clock and stranded the notification handshake — the OS waits
+        // for the WaveRT events, and those fire from nowhere else. That was
+        // the reported hang. The advance is the frames the wire actually
+        // carried, so a short URB advances what it sent and CompletedFrames
+        // never passes SubmittedFrames.
+        //
         // Several slots can complete on different CPUs at once, so the
         // position advances interlocked; the callback gets the new total.
         completed = InterlockedAdd64(&S->CompletedFrames,
-                                     (LONGLONG)S->NominalFrames);
+                                     (LONGLONG)(got / S->BytesPerFrame));
         if (S->RenderCompleted != NULL) {
             S->RenderCompleted(S->CallbackContext, (ULONGLONG)completed);
         }
@@ -320,21 +496,25 @@ EmuIsochReleasePending(
     }
 }
 
-// Reap one completed data slot: free it for the pump and drain Pending.
-// Idempotent by the ARMED -> FREE exchange: exactly one of the competing
-// reapers (the completion routine, the pump after a synchronous completion)
-// owns the harvest.
+// Reap one completed data slot: harvest first, then free the slot for the
+// pump, then drain Pending. The order is the rundown-safe one: the pump only
+// rebuilds FREE slots (it scans under PumpLock), so the URB the harvest reads
+// can never be rebuilt or resubmitted under it. An IRP completes exactly
+// once, so the ARMED exchange below is a tripwire against a double reap, not
+// an ownership gate — the harvest has already run when it fires. (The old
+// FREE-before-harvest order let the pump rebuild the slot while the statuses
+// were still being read; every error counter raced.)
 static BOOLEAN
 EmuIsochReapSlot(
     _Inout_ PEMU_ISOCH_STREAM S,
     _Inout_ PEMU_ISOCH_SLOT   Slot
     )
 {
+    EmuIsochHarvest(S, Slot);
     if (InterlockedExchange(&Slot->State, EMU_ISOCH_SLOT_FREE) !=
         EMU_ISOCH_SLOT_ARMED) {
         return FALSE;
     }
-    EmuIsochHarvest(S, Slot);
     EmuIsochReleasePending(S);
     return TRUE;
 }
@@ -362,7 +542,8 @@ EmuIsochDataCompletion(
 }
 
 // Reap one completed feedback URB. The values themselves (the device's frame
-// clock) are M5's input; today they only feed the counters.
+// clock) are M5's input; today they only feed the counters. Same
+// harvest-before-FREE order as the data slots.
 static BOOLEAN
 EmuIsochFbReap(
     _Inout_ PEMU_ISOCH_STREAM  S,
@@ -371,10 +552,6 @@ EmuIsochFbReap(
 {
     struct _URB_ISOCH_TRANSFER* u = &Fb->Urb->UrbIsochronousTransfer;
 
-    if (InterlockedExchange(&Fb->State, EMU_ISOCH_SLOT_FREE) !=
-        EMU_ISOCH_SLOT_ARMED) {
-        return FALSE;
-    }
     InterlockedIncrement(&S->Completes);
     if (!NT_SUCCESS((NTSTATUS)u->Hdr.Status) ||
         !USBD_SUCCESS(u->IsoPacket[0].Status)) {
@@ -383,13 +560,22 @@ EmuIsochFbReap(
                             (LONG)u->IsoPacket[0].Status);
     }
     InterlockedAdd(&S->Bytes, (LONG)u->IsoPacket[0].Length);
+    if (InterlockedExchange(&Fb->State, EMU_ISOCH_SLOT_FREE) !=
+        EMU_ISOCH_SLOT_ARMED) {
+        return FALSE;
+    }
     EmuIsochReleasePending(S);
     return TRUE;
 }
 
-// The feedback-URB completion: reap and resubmit — the vendor's self-restart
-// (FUN_0001466C). The re-arm chain is depth-bounded: a stack that completed
-// every feedback URB inline would otherwise recurse without end.
+// The feedback-URB completion: reap, account the error streak, and schedule
+// the re-arm on the slot's timer — never on this stack. The dump of the 0x133
+// shows why: the USB3 stack can complete the resubmitted URB inside the SAME
+// interrupter DPC this completion runs in (Isoch_MapTransfers fires within
+// the one DPC), so a direct resubmit cycles submit -> complete -> reap ->
+// resubmit forever in a single DPC and every per-chain depth guard resets
+// each lap. A 1 ms timer DPC carries at most one feedback submission; at the
+// normal 32 ms feedback cadence the deferral is noise.
 static NTSTATUS NTAPI
 EmuIsochFbCompletion(
     _In_ PDEVICE_OBJECT DeviceObject,
@@ -399,17 +585,58 @@ EmuIsochFbCompletion(
 {
     PEMU_ISOCH_FB_SLOT fb = (PEMU_ISOCH_FB_SLOT)Context;
     PEMU_ISOCH_STREAM S = fb->Stream;
+    struct _URB_ISOCH_TRANSFER* u = &fb->Urb->UrbIsochronousTransfer;
+    NTSTATUS urbStatus;
+    BOOLEAN fbOk;
+    LARGE_INTEGER due;
 
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Irp);
 
+    // The verdict is read before anything can rebuild the slot: this stack is
+    // the only context that can, and it has not set the timer yet.
+    urbStatus = (NTSTATUS)u->Hdr.Status;
+    fbOk = NT_SUCCESS(urbStatus) && USBD_SUCCESS(u->IsoPacket[0].Status);
+
     if (EmuIsochFbReap(S, fb)) {
-        if (InterlockedIncrement(&S->FbRearmDepth) <= 4) {
-            EmuIsochFeedbackRearm(S, (PEMU_DEVICE_CONTEXT)S->Owner, fb);
+        if (fbOk) {
+            InterlockedExchange(&S->FbConsecErrors, 0);
+        } else if (InterlockedIncrement(&S->FbConsecErrors) >=
+                   EMU_ISOCH_FB_FAIL_LIMIT) {
+            // The old code re-armed on error unconditionally: a deterministically
+            // broken endpoint fed itself forever (each cycle also marched the
+            // cursor +32 while the bus advanced ~0 — the 66-hour StartFrame of
+            // the dump). Bounded fail-stop: 4 consecutive errors end it.
+            EmuIsochFailStop(S, EMU_ISOCH_FAIL_FB,
+                             NT_SUCCESS(urbStatus)
+                                 ? (NTSTATUS)u->IsoPacket[0].Status
+                                 : urbStatus);
         }
-        InterlockedDecrement(&S->FbRearmDepth);
+        if (S->Quit == 0) {
+            due.QuadPart = -1 * 10000LL;   // 1 ms
+            KeSetTimer(&fb->Timer, due, &fb->TimerDpc);
+        }
     }
     return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+// The deferred feedback re-arm: runs in its own DPC, one submission, done.
+static VOID
+EmuIsochFbTimerDpc(
+    _In_ PKDPC  Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
+    )
+{
+    PEMU_ISOCH_FB_SLOT fb = (PEMU_ISOCH_FB_SLOT)DeferredContext;
+    PEMU_ISOCH_STREAM S = fb->Stream;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    EmuIsochFeedbackRearm(S, (PEMU_DEVICE_CONTEXT)S->Owner, fb);
 }
 
 // Per-submit URB fields for a data slot: everything but StartFrame, which the
@@ -537,6 +764,7 @@ EmuIsochPump(
         PIO_STACK_LOCATION stack;
         ULONG now;
         ULONG i;
+        LONG anchor;
         NTSTATUS status;
 
         KeAcquireSpinLock(&S->PumpLock, &oldIrql);
@@ -591,9 +819,15 @@ EmuIsochPump(
         // the interrupt-time mapping (see EmuIsochBusFrame): no bus submits
         // from inside the completion DPC.
         now = EmuIsochBusFrame(S);
-        if ((LONG)(S->CursorFrame - now) <= 0) {
-            S->CursorFrame = now + EMU_ISOCH_FRAME_MARGIN;
+        anchor = EmuIsochCursorAnchor(now, &S->CursorFrame);
+        if (anchor != 0) {
             S->AnchorFires++;
+            // anchor 2 is the lead-ceiling clamp: the cursor outran the bus.
+            // Counted separately so a runaway shows in the registry even when
+            // the stream otherwise looks healthy.
+            if (anchor == 2) {
+                S->ClampFires++;
+            }
         }
         u = &slot->Urb->UrbIsochronousTransfer;
         u->StartFrame = S->CursorFrame;
@@ -603,11 +837,20 @@ EmuIsochPump(
         IoReuseIrp(slot->Irp, STATUS_SUCCESS);
         stack = IoGetNextIrpStackLocation(slot->Irp);
         stack->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
+        stack->Parameters.DeviceIoControl.IoControlCode = IOCTL_INTERNAL_USB_SUBMIT_URB;
         USBD_AssignUrbToIoStackLocation(Ctx->UsbdHandle, stack, slot->Urb);
         IoSetCompletionRoutine(slot->Irp, EmuIsochDataCompletion, slot,
                                TRUE, TRUE, TRUE);
 
         slot->State = EMU_ISOCH_SLOT_ARMED;
+        if (InterlockedCompareExchange(&S->Pending, 0, 0) == 0) {
+            // The Idle latch, cleared whenever Pending is taken 0 -> 1. A
+            // notification event that is never cleared latches its first
+            // transient drain-to-zero forever, and the stop drain then
+            // returns instantly and retains the stream as "not drained" —
+            // the old behavior.
+            KeClearEvent(&S->Idle);
+        }
         InterlockedIncrement(&S->Pending);
         InterlockedIncrement(&S->Submits);
         KeReleaseSpinLock(&S->PumpLock, oldIrql);
@@ -623,11 +866,25 @@ EmuIsochPump(
             // entirely the completion's business. A stack that returns
             // without completing is contract-broken; the slot wedges ARMED,
             // the stop drain trips and FreeStream retains the stream.
-            if (!NT_SUCCESS(status) &&
-                InterlockedCompareExchange(&S->LastUrbStatus, 0, 0) !=
+            if (!NT_SUCCESS(status)) {
+                if (InterlockedCompareExchange(&S->LastUrbStatus, 0, 0) !=
                     (LONG)status) {
-                InterlockedIncrement(&S->UrbFailures);
-                InterlockedExchange(&S->LastUrbStatus, (LONG)status);
+                    InterlockedIncrement(&S->UrbFailures);
+                    InterlockedExchange(&S->LastUrbStatus, (LONG)status);
+                }
+                // A deterministic rejection feeds itself: each inline
+                // completion frees the slot and this loop arms again. The
+                // spin bound below caps one pump pass; this counter caps the
+                // stream — after EMU_ISOCH_SUBMIT_FAIL_LIMIT consecutive
+                // rejected submissions it fail-stops instead of handing the
+                // storm to the next pump event (the IOCTL-code bug class:
+                // every submit failed, nothing bounded the retrying).
+                if (InterlockedIncrement(&S->SubmitConsecErrors) >=
+                    EMU_ISOCH_SUBMIT_FAIL_LIMIT) {
+                    EmuIsochFailStop(S, EMU_ISOCH_FAIL_SUBMIT, status);
+                }
+            } else {
+                InterlockedExchange(&S->SubmitConsecErrors, 0);
             }
             // Spin bound: a run of inline completions means either a
             // deterministic rejection (retrying inside this call is futile,
@@ -639,6 +896,7 @@ EmuIsochPump(
             }
         } else {
             syncSpins = 0;
+            InterlockedExchange(&S->SubmitConsecErrors, 0);
         }
         // Loop: re-acquire at the top and keep draining the ring.
     }
@@ -648,8 +906,12 @@ EmuIsochPump(
 // Arm one feedback URB: two slots keep the endpoint serviced, consecutive
 // StartFrames exactly EMU_ISOCH_FB_STEP (32) apart — the trace's feedback
 // delta — and always in the future. The cursor re-anchors whenever it fell
-// into the past (the vendor's sync builder, FUN_00013E98 @0x3F1B). The
-// submit happens outside the pump lock, like the data pump.
+// into the past (the vendor's sync builder, FUN_00013E98 @0x3F1B) and is
+// clamped when it leads the bus by more than EMU_ISOCH_MAX_LEAD (the 0x133
+// runaway: each storm cycle marched the cursor +32 while the bus advanced
+// ~0). The submit happens outside the pump lock, like the data pump. Called
+// from the start path and from the slot's 1 ms timer DPC — never from inside
+// the completion.
 static VOID
 EmuIsochFeedbackRearm(
     _Inout_ PEMU_ISOCH_STREAM  S,
@@ -661,17 +923,26 @@ EmuIsochFeedbackRearm(
     PIO_STACK_LOCATION stack;
     KIRQL oldIrql;
     ULONG now;
+    LONG anchor;
     NTSTATUS status;
 
     KeAcquireSpinLock(&S->PumpLock, &oldIrql);
-    if (S->FeedbackPipe == NULL || !S->Active || S->Quit != 0) {
+    if (S->FeedbackPipe == NULL || !S->Active || S->Quit != 0 ||
+        Fb->State != EMU_ISOCH_SLOT_FREE) {
+        // The State check: the timer DPC can overlap a restart's initial arm
+        // or fire after a stop's cancel; an ARMED slot must never be rebuilt
+        // — that would IoReuseIrp an IRP still in flight.
         KeReleaseSpinLock(&S->PumpLock, oldIrql);
         return;
     }
 
     now = EmuIsochBusFrame(S);
-    if ((LONG)(S->FbCursorFrame - now) <= 0) {
-        S->FbCursorFrame = now + EMU_ISOCH_FRAME_MARGIN;
+    anchor = EmuIsochCursorAnchor(now, &S->FbCursorFrame);
+    if (anchor != 0) {
+        S->AnchorFires++;
+        if (anchor == 2) {
+            S->ClampFires++;
+        }
     }
     u = &Fb->Urb->UrbIsochronousTransfer;
     u->Hdr.Function = URB_FUNCTION_ISOCH_TRANSFER;
@@ -691,19 +962,24 @@ EmuIsochFeedbackRearm(
     IoReuseIrp(Fb->Irp, STATUS_SUCCESS);
     stack = IoGetNextIrpStackLocation(Fb->Irp);
     stack->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
+    stack->Parameters.DeviceIoControl.IoControlCode = IOCTL_INTERNAL_USB_SUBMIT_URB;
     USBD_AssignUrbToIoStackLocation(Ctx->UsbdHandle, stack, Fb->Urb);
     IoSetCompletionRoutine(Fb->Irp, EmuIsochFbCompletion, Fb, TRUE, TRUE, TRUE);
 
     Fb->State = EMU_ISOCH_SLOT_ARMED;
+    if (InterlockedCompareExchange(&S->Pending, 0, 0) == 0) {
+        // The Idle latch, cleared on every 0 -> 1 step (see the pump).
+        KeClearEvent(&S->Idle);
+    }
     InterlockedIncrement(&S->Pending);
     InterlockedIncrement(&S->Submits);
     KeReleaseSpinLock(&S->PumpLock, oldIrql);
 
     status = IoCallDriver(Ctx->Pdo, Fb->Irp);
     if (status != STATUS_PENDING) {
-        // Completed inline: the completion reaped and (depth permitting)
-        // re-armed already, on this same thread. The slot lifecycle stays
-        // the completion's — see the data pump for the contract analysis.
+        // Completed inline: the completion reaped and scheduled the timer
+        // already, on this same thread. The slot lifecycle stays the
+        // completion's — see the data pump for the contract analysis.
         if (!NT_SUCCESS(status) &&
             InterlockedCompareExchange(&S->LastUrbStatus, 0, 0) !=
                 (LONG)status) {
@@ -824,12 +1100,17 @@ EmuIsochFreeStream(
     S->Starved = 0;
     S->Underruns = 0;
     S->Pumping = 0;
-    S->FbRearmDepth = 0;
+    S->FailStage = EMU_ISOCH_FAIL_NONE;
+    S->FailStatus = 0;
+    S->SubmitConsecErrors = 0;
+    S->UrbConsecErrors = 0;
+    S->FbConsecErrors = 0;
     S->FqInline = 0;
     S->FqFloat = 0;
     S->FqFail = 0;
     S->FqBusy = 0;
     S->AnchorFires = 0;
+    S->ClampFires = 0;
     S->NowLast = 0;
     S->CursorLast = 0;
     S->PumpQuitExit = 0;
@@ -866,6 +1147,7 @@ EmuIsochStopStream(
     LARGE_INTEGER             wait;
     KIRQL                     oldIrql;
     ULONG                     waits = 0;
+    ULONG                     i;
     NTSTATUS                  status;
 
     PAGED_CODE();
@@ -883,7 +1165,8 @@ EmuIsochStopStream(
     KeReleaseSpinLock(&S->PumpLock, oldIrql);
 
     // The wire verdict of the pump: gate-blocked passes since start, the
-    // frame-query outcomes, the anchor's view, and why the pump stopped.
+    // frame-query outcomes, the anchor's view, the fail-stop verdict and why
+    // the pump stopped.
     {
         EmuNoteStatusValue(Ctx, Direction == EMU_STREAM_RENDER
                                 ? L"PumpUnderruns" : L"PumpUnderrunsC",
@@ -893,6 +1176,9 @@ EmuIsochStopStream(
         EmuNoteStatusValue(Ctx, L"FqFail", (ULONG)S->FqFail);
         EmuNoteStatusValue(Ctx, L"FqBusy", (ULONG)S->FqBusy);
         EmuNoteStatusValue(Ctx, L"AnchorFires", (ULONG)S->AnchorFires);
+        EmuNoteStatusValue(Ctx, L"ClampFires", (ULONG)S->ClampFires);
+        EmuNoteStatusValue(Ctx, L"FailStage", (ULONG)S->FailStage);
+        EmuNoteStatusValue(Ctx, L"FailStatus", (ULONG)S->FailStatus);
         EmuNoteStatusValue(Ctx, L"NowLast", S->NowLast);
         EmuNoteStatusValue(Ctx, L"CursorLast", S->CursorLast);
         EmuNoteStatusValue(Ctx, L"PumpQuitExit", (ULONG)S->PumpQuitExit);
@@ -915,8 +1201,14 @@ EmuIsochStopStream(
             abortUrb->UrbPipeRequest.PipeHandle = S->Pipe;
             status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, abortUrb);
             // EmuUsbSubmitUrb is synchronous, so the allocation is no longer
-            // referenced by its IRP at this point.
-            USBD_UrbFree(Ctx->UsbdHandle, abortUrb);
+            // referenced by its IRP — except on the retained-timeout path
+            // (STATUS_CANCELLED): the stack still owns the flight and its
+            // completion will still write the URB status, so the URB is
+            // retained alongside the IRP. A deliberate leak on a black-holed
+            // device beats freeing memory the stack can still touch.
+            if (status != STATUS_CANCELLED) {
+                USBD_UrbFree(Ctx->UsbdHandle, abortUrb);
+            }
         }
         if (!NT_SUCCESS(status)) {
             EMU_LOG_WARN(STR_MODULENAME "abort pipe (dir %lu) failed, 0x%x\n",
@@ -931,14 +1223,48 @@ EmuIsochStopStream(
                 (USHORT)sizeof(struct _URB_PIPE_REQUEST);
             abortUrb->UrbPipeRequest.Hdr.Status = 0;
             abortUrb->UrbPipeRequest.PipeHandle = S->FeedbackPipe;
-            (VOID)EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, abortUrb);
-            USBD_UrbFree(Ctx->UsbdHandle, abortUrb);
+            status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, abortUrb);
+            if (status != STATUS_CANCELLED) {
+                USBD_UrbFree(Ctx->UsbdHandle, abortUrb);
+            }
         }
     }
 
-    // Drain: after the aborts every armed URB completes; each reap drains
-    // Pending and the last one sets Idle. The timeout is a tripwire only - a
-    // stream that outlives it is retained, never freed.
+    // Cancel what the aborts cannot reach. The pipe aborts flush everything
+    // queued on them, but a contract-broken stack can return non-pending
+    // without running the completion (the wedged-ARMED class), and the frame
+    // query lives on no pipe at all — a floated query kept Pending raised
+    // until a completion that might never come. IoCancelIrp on the owned
+    // IRPs turns every such wedge into a completion with STATUS_CANCELLED;
+    // the drain below then actually drains. Cancelled feedback completions
+    // schedule no new re-arm (the completion checks Quit), and both timers
+    // are disarmed so no deferred re-arm wakes up mid-drain.
+    KeAcquireSpinLock(&S->PumpLock, &oldIrql);
+    for (i = 0; i < EMU_ISOCH_SLOTS; i++) {
+        if (S->Slots[i].State == EMU_ISOCH_SLOT_ARMED &&
+            S->Slots[i].Irp != NULL) {
+            IoCancelIrp(S->Slots[i].Irp);
+        }
+    }
+    for (i = 0; i < EMU_ISOCH_FB_SLOTS; i++) {
+        KeCancelTimer(&S->Fb[i].Timer);
+        if (S->Fb[i].State == EMU_ISOCH_SLOT_ARMED &&
+            S->Fb[i].Irp != NULL) {
+            IoCancelIrp(S->Fb[i].Irp);
+        }
+    }
+    KeReleaseSpinLock(&S->PumpLock, oldIrql);
+    if (S->FrameIrp != NULL &&
+        InterlockedCompareExchange(&S->FrameBusy, 0, 0) != 0) {
+        IoCancelIrp(S->FrameIrp);
+    }
+
+    // Drain: after the aborts and cancels every armed URB completes; each
+    // reap drains Pending and the last one sets Idle. The event is cleared
+    // first — a stale signal from a transient drain during streaming would
+    // otherwise make every wait below return instantly. The timeout is a
+    // tripwire only - a stream that outlives it is retained, never freed.
+    KeClearEvent(&S->Idle);
     wait.QuadPart = -1 * 1000 * 10000LL;   // 1 s per wait, 3 s total
     while (InterlockedCompareExchange(&S->Pending, 0, 0) != 0) {
         status = KeWaitForSingleObject(&S->Idle, Executive, KernelMode, FALSE,
@@ -950,6 +1276,22 @@ EmuIsochStopStream(
             break;
         }
     }
+
+    // Close the completion-tail window: Pending can reach zero while the
+    // last completion is still running its pump tail, or while the frame
+    // query's completion is between the drain and the event. Both flags
+    // clear within one completion; the bound exists so a wedged completion
+    // cannot hang the stop path (FreeStream's Pending re-check is still the
+    // load-bearing tripwire).
+    wait.QuadPart = -1 * 10000LL;   // 1 ms
+    for (waits = 0; waits < 100; waits++) {
+        if (InterlockedCompareExchange(&S->Pumping, 0, 0) == 0 &&
+            InterlockedCompareExchange(&S->FrameBusy, 0, 0) == 0) {
+            break;
+        }
+        KeDelayExecutionThread(KernelMode, FALSE, &wait);
+    }
+
     EmuIsochFreeStream(Ctx, Direction);
 }
 
@@ -1124,11 +1466,17 @@ EmuIsochStartStream(
     }
     // The wire grid, byte-for-byte the vendor's (trace + disassembly of
     // emusba10): each URB covers ONE millisecond frame and carries TWO
-    // 24-frame packets (microframes 0 and 4 of the bInterval=3 endpoint; the
-    // USBD PipeInformation.Interval reads 4 = microframes per packet), the
-    // schedule leads the current frame by 3, eight URBs in flight, one frame
-    // step per URB. The feedback endpoint reports 24 frames per 500-us window
-    // (16.16 value 0x00180000) and is serviced by two async URBs.
+    // 24-frame packets, which requires the data endpoint to service every
+    // 500 us (raw bInterval 3 = 4 microframes; the vendor's packets land on
+    // microframes 0 and 4 of each 1 ms frame — the trace). The alt selection
+    // (EmuIsochFindEngineAlt) picks exactly that alt. USBD
+    // PipeInformation.Interval reads the RAW descriptor bInterval — the old
+    // "reads 4 = microframes per packet" note here was a misreading that had
+    // the engine arm the bInterval-4 alt, and on the wire that made the
+    // capture IN URBs complete with CRC/babble and half the render packets
+    // with ISO_TD_ERROR (hardware session 2026-11-07). The feedback endpoint
+    // reports 24 frames per 500-us window (16.16 value 0x00180000) and is
+    // serviced by two async URBs.
     S->PeriodUs = 1000;
     S->FramesPerPacket = RateHz / 1000;   // 48: frames per URB (both packets)
     if (S->FramesPerPacket < EMU_ISOCH_PKTS_PER_URB) {
@@ -1149,6 +1497,15 @@ EmuIsochStartStream(
     EmuNoteStatusValue(Ctx, Direction == EMU_STREAM_RENDER
                             ? L"TestFb0" : L"TestFb1",
                        feedbackPipe != NULL ? 1 : 0);
+    // Which alternate the stream actually runs on. The bInterval question
+    // (raw descriptor says 4 = 1 ms service interval on the data endpoint,
+    // while the vendor trace says two packets per 1 ms at microframes 0 and
+    // 4, i.e. a 500 us interval) is settled by the wire, not by the fixture:
+    // this value plus TestPipe*/PipeUs* pin the choice for the next trace
+    // comparison. High byte interface, low byte alternate.
+    EmuNoteStatusValue(Ctx, Direction == EMU_STREAM_RENDER
+                            ? L"AltSelR" : L"AltSelC",
+                       (Alt->InterfaceNumber << 8) | (Alt->AltSetting & 0xFF));
 
     S->Buffer = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                         (SIZE_T)EMU_ISOCH_SLOTS * S->SlotBytes,
@@ -1199,6 +1556,8 @@ EmuIsochStartStream(
         RtlZeroMemory(fb, sizeof(*fb));
         fb->Stream = S;
         fb->State = EMU_ISOCH_SLOT_FREE;
+        KeInitializeTimer(&fb->Timer);
+        KeInitializeDpc(&fb->TimerDpc, EmuIsochFbTimerDpc, fb);
         fb->Buffer = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, 8,
                                              EMU_POOLTAG);
         if (fb->Buffer == NULL) {
@@ -1247,12 +1606,17 @@ EmuIsochStartStream(
     S->Starved = 0;
     S->Underruns = 0;
     S->Pumping = 0;
-    S->FbRearmDepth = 0;
+    S->FailStage = EMU_ISOCH_FAIL_NONE;
+    S->FailStatus = 0;
+    S->SubmitConsecErrors = 0;
+    S->UrbConsecErrors = 0;
+    S->FbConsecErrors = 0;
     S->FqInline = 0;
     S->FqFloat = 0;
     S->FqFail = 0;
     S->FqBusy = 0;
     S->AnchorFires = 0;
+    S->ClampFires = 0;
     S->NowLast = 0;
     S->CursorLast = 0;
     S->PumpQuitExit = 0;
@@ -1277,14 +1641,27 @@ EmuIsochStartStream(
         if (NT_SUCCESS(status)) {
             ULONG f2 = S->FrameUrb->UrbGetCurrentFrameNumber.FrameNumber;
             ULONG delta = f2 > f1 ? f2 - f1 : 1;
+            ULONG units = delta / 10;
 
-            S->FramesPerMs = delta / 10;
-            if (S->FramesPerMs == 0) {
-                S->FramesPerMs = 1;
-            }
+            // The raw value lands in the registry even when it is refused:
+            // the next diagnosis should not have to guess what the device
+            // actually reported.
             EmuNoteStatusValue(Ctx, Direction == EMU_STREAM_RENDER
                                     ? L"CalFramesPerMs" : L"CalFramesPerMsC",
-                               S->FramesPerMs);
+                               units);
+            if (!EmuIsochFramesPerMsValid(units)) {
+                // The mapping scales every anchor with this number; garbage
+                // units schedule every packet into the past or the far
+                // future — the runaway class. The old code silently mapped 0
+                // to 1; a frozen or foreign counter now fails the start
+                // loudly instead.
+                EMU_LOG_ERROR(STR_MODULENAME "dir %lu: frame counter units %lu "
+                              "over a 10 ms window are not schedulable\n",
+                              Direction, units);
+                EmuIsochFreeStream(Ctx, Direction);
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            }
+            S->FramesPerMs = units;
         }
     }
     if (!NT_SUCCESS(status)) {
@@ -1320,12 +1697,21 @@ EmuIsochStartStream(
                 (USHORT)sizeof(struct _URB_PIPE_REQUEST);
             resetUrb->UrbPipeRequest.Hdr.Status = 0;
             resetUrb->UrbPipeRequest.PipeHandle = S->Pipe;
-            (VOID)EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, resetUrb);
+            status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, resetUrb);
             if (S->FeedbackPipe != NULL) {
                 resetUrb->UrbPipeRequest.PipeHandle = S->FeedbackPipe;
-                (VOID)EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, resetUrb);
+                if (EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, resetUrb) ==
+                    STATUS_CANCELLED) {
+                    status = STATUS_CANCELLED;
+                }
             }
-            USBD_UrbFree(Ctx->UsbdHandle, resetUrb);
+            // Retained-timeout contract: on STATUS_CANCELLED the stack still
+            // owns the flight and its completion will still write the URB
+            // status — the URB is retained with the IRP (see
+            // EmuUsbSubmitUrb), not freed under it.
+            if (status != STATUS_CANCELLED) {
+                USBD_UrbFree(Ctx->UsbdHandle, resetUrb);
+            }
         }
     }
 
@@ -1342,6 +1728,25 @@ EmuIsochStartStream(
         EmuIsochFeedbackRearm(S, Ctx, &S->Fb[i]);
     }
     return STATUS_SUCCESS;
+}
+
+// The engine's alternate pick: the stream facts of EmuCapsFindAlt plus the
+// wire-grid preference (EMU_ISOCH_DATA_BINTERVAL). Falls back to the plain
+// descriptor-order match for devices that list no 500 us alt.
+static const EMU_STREAM_ALT*
+EmuIsochFindEngineAlt(
+    _In_ const EMU_DEVICE_CAPS* Caps,
+    _In_ ULONG Direction,
+    _In_ ULONG Channels,
+    _In_ ULONG RateHz
+    )
+{
+    ULONG i = EmuIsochPickAltIndex(Caps->StreamAlts, Caps->StreamAltCount,
+                                   Direction, Channels, RateHz);
+
+    return i < Caps->StreamAltCount
+        ? &Caps->StreamAlts[i]
+        : EmuCapsFindAlt(Caps, Direction, Channels, RateHz);
 }
 
 NTSTATUS
@@ -1368,7 +1773,7 @@ EmuIsochStartRender(
     if (S->Active) {
         return STATUS_DEVICE_BUSY;
     }
-    alt = EmuCapsFindAlt(Ctx->Caps, EMU_STREAM_RENDER, 2, RateHz);
+    alt = EmuIsochFindEngineAlt(Ctx->Caps, EMU_STREAM_RENDER, 2, RateHz);
     if (alt == NULL) {
         return STATUS_NO_MATCH;
     }
@@ -1482,8 +1887,8 @@ EmuIsochStartStreams(
     }
 
     // Both alternates must exist before anything changes on the device.
-    alt[0] = EmuCapsFindAlt(Ctx->Caps, EMU_STREAM_RENDER, 2, RateHz);
-    alt[1] = EmuCapsFindAlt(Ctx->Caps, EMU_STREAM_CAPTURE, 2, RateHz);
+    alt[0] = EmuIsochFindEngineAlt(Ctx->Caps, EMU_STREAM_RENDER, 2, RateHz);
+    alt[1] = EmuIsochFindEngineAlt(Ctx->Caps, EMU_STREAM_CAPTURE, 2, RateHz);
     if (alt[0] == NULL || alt[1] == NULL) {
         EMU_LOG_ERROR(STR_MODULENAME "no 2ch %lu Hz alt pair\n", RateHz);
         return STATUS_INVALID_PARAMETER;

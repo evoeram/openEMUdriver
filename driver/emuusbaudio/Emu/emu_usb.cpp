@@ -94,8 +94,23 @@ EmuUsbSubmitUrb(
             IoCancelIrp(irp);
             wait = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE,
                                          &timeout);
+            if (wait == STATUS_TIMEOUT) {
+                // Even the cancellation did not complete within the bound:
+                // the stack still owns the IRP's flight. Freeing the IRP here
+                // would hand the eventual completion a freed IRP, and the
+                // caller frees the URB right after this returns — the one
+                // thing this driver never does is free memory an in-flight
+                // request can still touch. The IRP is therefore retained
+                // (deliberately leaked: it is one IRP on a black-holed
+                // device) and STATUS_CANCELLED tells the caller not to free
+                // a USBD-allocated URB either — the completion will still
+                // write the URB status. The retained-timeout contract.
+                EMU_LOG_ERROR(STR_MODULENAME "URB still in flight after "
+                              "cancel - IRP retained\n");
+                return STATUS_CANCELLED;
+            }
             status = irp->IoStatus.Status;
-            if (NT_SUCCESS(status) || wait == STATUS_TIMEOUT) {
+            if (NT_SUCCESS(status)) {
                 status = STATUS_IO_TIMEOUT;
             }
             EMU_LOG_WARN(STR_MODULENAME "URB timed out after 3 s, status 0x%x\n",
@@ -146,7 +161,12 @@ EmuUsbReadConfigDescriptor(
                       (ULONG)urb->UrbHeader.Status);
         status = STATUS_DEVICE_HARDWARE_ERROR;
     }
-    USBD_UrbFree(Ctx->UsbdHandle, urb);
+    // Retained-timeout contract (see EmuUsbSubmitUrb): the URB stays alive
+    // with the IRP it is submitted on when the flight was never observed to
+    // end.
+    if (status != STATUS_CANCELLED) {
+        USBD_UrbFree(Ctx->UsbdHandle, urb);
+    }
 
     // A short control read is not a partial success: the parser insists on the
     // whole block, and so do we.
@@ -217,7 +237,12 @@ EmuUsbSendControl(
                      (ULONG)urb->UrbHeader.Status);
         status = STATUS_DEVICE_HARDWARE_ERROR;
     }
-    USBD_UrbFree(Ctx->UsbdHandle, urb);
+    // Retained-timeout contract (see EmuUsbSubmitUrb): the URB stays alive
+    // with the IRP it is submitted on when the flight was never observed to
+    // end.
+    if (status != STATUS_CANCELLED) {
+        USBD_UrbFree(Ctx->UsbdHandle, urb);
+    }
 
     if (NT_SUCCESS(status) && transferred != Request->PayloadLength) {
         EMU_LOG_WARN(STR_MODULENAME "class request cs 0x%02X unit 0x%02X returned "

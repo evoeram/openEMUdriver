@@ -325,6 +325,14 @@ EmuUsbSendControl(
 // Submit one built URB synchronously and return its status. The iso engine
 // (emu_isoch.cpp) uses it for the frame-number query and the pipe abort; the
 // engine's own packet submissions manage their IRPs directly.
+//
+// Retained-timeout contract: STATUS_CANCELLED means the transfer was canceled
+// after a 3 s timeout and even the cancellation did not complete within
+// another bound — the stack still owns the IRP's flight, the IRP is retained
+// (deliberately leaked, never freed in flight), and the caller must NOT free
+// a USBD-allocated URB either, because the eventual completion still writes
+// the URB status. Any other status means the transfer is no longer in flight
+// and the caller owns everything again.
 NTSTATUS
 EmuUsbSubmitUrb(
     _In_ PDEVICE_OBJECT Target,
