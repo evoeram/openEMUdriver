@@ -85,8 +85,8 @@ private:
     LIST_ENTRY m_NotificationList;
     KSPIN_LOCK m_NotificationLock;
     // Absolute ring-packet index the OS has last claimed written (wrap-aware
-    // reconstruction of the cyclic SetWritePacket argument). The ISO worker
-    // gates packet submission on it.
+    // reconstruction of the cyclic SetWritePacket argument). The ISO pump's
+    // data gate and the availability callback below read it.
     ULONGLONG m_LastOsWriteAbs;
 
 public:
@@ -103,10 +103,20 @@ public:
         _In_ PPORTWAVERTSTREAM PortStream
         );
 
-    static NTSTATUS NTAPI FillUsbPacket(
+    // PEMU_ISOCH_FILL_RENDER: packs Frames frames from the WaveRT ring into
+    // the USB transfer buffer. Returns the frames actually written; 0 means
+    // nothing went in and the pump must not submit the URB.
+    static ULONG NTAPI FillUsbPacket(
         _Inout_ PVOID Context,
         _Out_writes_bytes_(Frames * 6) PUCHAR Destination,
         _In_ ULONG Frames,
+        _In_ ULONGLONG LinearFramePosition
+        );
+
+    // PEMU_ISOCH_RENDER_AVAILABLE: frames released by the OS past the
+    // position. The pump's data gate; DPC-safe (counter reads only).
+    static ULONGLONG NTAPI FramesAvailable(
+        _Inout_ PVOID Context,
         _In_ ULONGLONG LinearFramePosition
         );
 
@@ -118,6 +128,11 @@ public:
 private:
     ULONGLONG TotalCompletedFrames();
     ULONGLONG TotalSubmittedFrames();
+    // The packet-model bootstrap: signal the registered notification events
+    // once at RUN, before any URB completion exists (the pump arms nothing
+    // until the OS releases data, and the engine paces its writes on these
+    // events — someone has to move first).
+    VOID KickNotifications();
     NTSTATUS AllocateBuffer(
         _In_ ULONG NotificationCount,
         _In_ ULONG RequestedSize,

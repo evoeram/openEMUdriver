@@ -518,6 +518,18 @@ static volatile LONG g_FillSeen;      // one-shot: first FillUsbPacket entry
 static volatile LONG g_FillRejected;  // one-shot: first validation rejection
 static volatile LONG g_PosIrql;       // highest IRQL GetPosition was seen at
 static ULONG g_Underruns;
+// SetWritePacket verdicts: the pump's only data source is the OS's release
+// path, so its acceptance record is the difference between "wire silent
+// because the engine never released" and "wire silent because we rejected".
+static volatile LONG g_SwrSeen;    // one-shot: first accepted release
+static ULONG g_SwrLate;            // DATA_LATE_ERROR answers
+static ULONG g_SwrOver;            // DATA_OVERRUN answers
+static volatile LONG g_NotifKick;  // one-shot: the RUN bootstrap signal fired
+// Fill rejection forensics (flushed at STOP; registry writes are PASSIVE-only
+// and the pump fills at DISPATCH too): why the last rejected fill returned 0.
+static ULONG g_FillRejectReason;   // 1 = validation, 2 = ring spans, 3 = pack
+static ULONGLONG g_FillRejectPos;  // LinearFramePosition of the rejection
+static ULONG g_FillBufferBytes;    // the WaveRT ring size the fill lives by
 
 #pragma code_seg("PAGE")
 STDMETHODIMP_(NTSTATUS) CEmuWaveMiniport::DataRangeIntersection(
@@ -1304,6 +1316,22 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetWritePacket(
     // The OS passes the cyclic ring-packet index; reconstruct the absolute
     // packet index by unwrapping forward from the last accepted one.
     submittedAbs = (LONG)(TotalSubmittedFrames() / m_NotificationFrames);
+    if (m_LastOsWriteAbs == 0 && submittedAbs == 0) {
+        // The OS's first release of the session. The unwrap below assumes a
+        // prior accepted release and turns SetWritePacket(0) into delta 0 →
+        // ahead 0 → "late" — which starves the pump forever: no accepted
+        // release, no URB, no completion, no notification event, no further
+        // writes from the engine (the handshake deadlock of the prime-less
+        // pump; the old prime bootstrapped this by completing URBs that were
+        // never there). Releasing packet k first means packets 0..k are in
+        // the ring — the engine fills sequentially.
+        m_LastOsWriteAbs = (ULONGLONG)PacketNumber + 1;
+        if (InterlockedCompareExchange(&g_SwrSeen, 1, 0) == 0) {
+            EmuNoteStatusValue(NULL, L"SwrFirst", PacketNumber);
+        }
+        EmuIsochRenderDataReady(m_Context);
+        return STATUS_SUCCESS;
+    }
     delta = (LONG)((ULONG)m_LastOsWriteAbs % m_NotificationCount);
     delta = (LONG)PacketNumber - delta;
     if (delta < 0) {
@@ -1313,13 +1341,21 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetWritePacket(
     ahead = (LONG)(m_LastOsWriteAbs + (ULONGLONG)delta - submittedAbs);
     if (ahead < 1) {
         // The driver already consumed this packet: OS underrun.
+        g_SwrLate++;
+        InterlockedIncrement((volatile LONG*)&g_Underruns);
         return STATUS_DATA_LATE_ERROR;
     }
     if (ahead > EMU_ISOCH_SLOTS) {
         // Beyond the pipeline: the data would never be read in order.
+        g_SwrOver++;
         return STATUS_DATA_OVERRUN;
     }
     m_LastOsWriteAbs += (ULONGLONG)delta;
+
+    // Data arrival: the analog of the vendor's pump call from its KS ring
+    // write (FUN_00013424). The pump arms URBs for everything released so
+    // far; an empty pipeline starts here, re-anchored to the current frame.
+    EmuIsochRenderDataReady(m_Context);
 
     // Flush the silence probe here: the packet-model engine talks to the
     // stream through Set/GetPacketCount and never calls the legacy
@@ -1431,6 +1467,15 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetState(_In_ KSSTATE State)
         EmuNoteStatusValue(m_Context, L"FillCalls", g_FillCalls);
         EmuNoteStatusValue(m_Context, L"ArmTicks", g_ArmTicks);
 EmuNoteStatusValue(m_Context, L"Underruns", g_Underruns);
+        // The release-path verdicts: SwrLate/SwrOver count the OS's releases
+        // we refused; a stream that never filled the ring shows it here.
+        EmuNoteStatusValue(m_Context, L"SwrLate", g_SwrLate);
+        EmuNoteStatusValue(m_Context, L"SwrOver", g_SwrOver);
+        // The fill-rejection forensics: reason, position, ring size.
+        EmuNoteStatusValue(m_Context, L"FillRejectReason", g_FillRejectReason);
+        EmuNoteStatusValue(m_Context, L"FillRejectPos",
+                           (ULONG)g_FillRejectPos);
+        EmuNoteStatusValue(m_Context, L"FillBufferBytes", g_FillBufferBytes);
         m_BaseFrames = 0;
         m_NextNotificationFrame = m_NotificationFrames;
         m_LastOsWriteAbs = 0;
@@ -1459,9 +1504,16 @@ EmuNoteStatusValue(m_Context, L"Underruns", g_Underruns);
                 break;
             }
             m_LastOsWriteAbs = 0;
+            m_NextNotificationFrame = m_NotificationFrames;
+            // The handshake verdict: the packet size the pump's data gate
+            // and the release unwrap live by. Absent with a running stream
+            // means the session never negotiated the packet model.
+            EmuNoteStatusValue(m_Context, L"NotifyFrames",
+                               (m_NotificationCount << 20) |
+                               m_NotificationFrames);
             status = EmuIsochStartRender(
                 m_Context, EMU_AUDIO_M4_RATE_HZ, m_BaseFrames,
-                this, FillUsbPacket, UsbPacketCompleted);
+                this, FillUsbPacket, FramesAvailable, UsbPacketCompleted);
             // Probe instrumentation: was the arm site reached at all, and with
             // which start verdict - the silence probe never sampled while the
             // stream demonstrably ran, so every step of its chain gets a wire
@@ -1469,6 +1521,11 @@ EmuNoteStatusValue(m_Context, L"Underruns", g_Underruns);
             EmuNoteStatusValue(m_Context, L"ProbeArm", (ULONG)status | 0x10000000);
             if (NT_SUCCESS(status)) {
                 InterlockedIncrement((volatile LONG*)&g_ArmTicks);
+                // Bootstrap the packet-model handshake: the engine paces its
+                // ring writes on the notification events, and those fire only
+                // from URB completions — while the pump arms no URB before
+                // the OS releases data. Someone moves first; make it us.
+                KickNotifications();
             }
         }
         break;
@@ -1489,7 +1546,7 @@ EmuNoteStatusValue(m_Context, L"Underruns", g_Underruns);
 }
 
 #pragma code_seg()
-NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
+ULONG NTAPI CEmuWaveStream::FillUsbPacket(
     _Inout_ PVOID Context,
     _Out_writes_bytes_(Frames * 6) PUCHAR Destination,
     _In_ ULONG Frames,
@@ -1500,15 +1557,18 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
     EMU_AUDIO_RING_SPAN spans[2];
     ULONG spanCount;
     ULONG hostFrameBytes = EMU_AUDIO_M4_CHANNELS * EMU_AUDIO_HOST_SAMPLE_BYTES;
+    BOOLEAN passive = KeGetCurrentIrql() == PASSIVE_LEVEL;
 
     // Probe instrumentation: if this counter stays at zero while the stream
     // submits, the wire is fed by the prime-pass pattern, not by the client.
+    // Runs in the ISO pump — PASSIVE from the write-packet path, DISPATCH
+    // from the URB completion.
     InterlockedIncrement((volatile LONG*)&g_FillCalls);
 
-    // One-shot direct registry writes from the worker (PASSIVE): they bypass
-    // the Dirty/flush indirection entirely. If FillSeen appears but the
-    // probe's ProbeLive does not, the divergence is inside this function.
-    if (InterlockedCompareExchange(&g_FillSeen, 1, 0) == 0) {
+    // One-shot direct registry writes: legal only at PASSIVE. If FillSeen
+    // appears but the probe's ProbeLive does not, the divergence is inside
+    // this function.
+    if (passive && InterlockedCompareExchange(&g_FillSeen, 1, 0) == 0) {
         EmuNoteStatusValue(NULL, L"FillSeen", (ULONG)LinearFramePosition);
         EmuNoteStatusValue(NULL, L"FillSeenFrames", Frames);
         EmuNoteStatusValue(NULL, L"FillSeenBuffer", stream != NULL
@@ -1518,21 +1578,29 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
     if (stream == NULL || Destination == NULL || Frames == 0 ||
         stream->m_Buffer == NULL ||
         LinearFramePosition > (~(ULONGLONG)0) / hostFrameBytes ||
-        Frames > stream->m_BufferBytes / hostFrameBytes ||
-        !EmuAudioRingSpans(LinearFramePosition * hostFrameBytes,
-                           stream->m_BufferBytes, hostFrameBytes, Frames,
-                           spans, &spanCount)) {
-        // One-shot: the worker keeps calling with parameters this fill
-        // rejects. The submit counters growing alongside this value would
-        // mean the data gate never sees this function succeed.
-        if (InterlockedCompareExchange(&g_FillRejected, 1, 0) == 0) {
+        Frames > stream->m_BufferBytes / hostFrameBytes) {
+        g_FillRejectReason = 1;
+        g_FillRejectPos = LinearFramePosition;
+        g_FillBufferBytes = stream != NULL ? stream->m_BufferBytes : 0;
+        // One-shot: the pump keeps calling with parameters this fill rejects.
+        // The submit counters growing alongside this value would mean the
+        // data gate never sees this function succeed.
+        if (passive && InterlockedCompareExchange(&g_FillRejected, 1, 0) == 0) {
             EmuNoteStatusValue(NULL, L"FillRejected", Frames);
             EmuNoteStatusValue(NULL, L"FillRejectedPos",
                                (ULONG)LinearFramePosition);
             EmuNoteStatusValue(NULL, L"FillRejectedBuf", stream != NULL
                                    ? stream->m_BufferBytes : 0);
         }
-        return STATUS_INVALID_PARAMETER;
+        return 0;
+    }
+    if (!EmuAudioRingSpans(LinearFramePosition * hostFrameBytes,
+                           stream->m_BufferBytes, hostFrameBytes, Frames,
+                           spans, &spanCount)) {
+        g_FillRejectReason = 2;
+        g_FillRejectPos = LinearFramePosition;
+        g_FillBufferBytes = stream->m_BufferBytes;
+        return 0;
     }
 
     for (ULONG i = 0; i < spanCount; i++) {
@@ -1540,33 +1608,20 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
         if (!EmuAudioPack24(Destination,
                             stream->m_Buffer + spans[i].Offset,
                             spanFrames, EMU_AUDIO_M4_CHANNELS)) {
-            return STATUS_INVALID_PARAMETER;
+            g_FillRejectReason = 3;
+            g_FillRejectPos = LinearFramePosition;
+            g_FillBufferBytes = stream->m_BufferBytes;
+            return 0;
         }
         Destination += spanFrames * EMU_AUDIO_M4_CHANNELS *
             EMU_AUDIO_USB_SAMPLE_BYTES;
     }
 
-    // Data gate (packet model): do not put a packet on the wire before the OS
-    // has written it. The worker thread runs at PASSIVE_LEVEL, so a short
-    // bounded wait is allowed; a timeout is an OS underrun - the stale ring
-    // content goes out (a glitch), counted, instead of an eternal zero loop.
-    if (stream->m_NotificationCount != 0) {
-        ULONGLONG packetAbs = (LinearFramePosition - stream->m_BaseFrames) /
-            stream->m_NotificationFrames;
-        LARGE_INTEGER oneMs;
-        ULONG spin;
-
-        oneMs.QuadPart = -10000LL;
-        for (spin = 0; spin < 6; spin++) {
-            if (stream->m_LastOsWriteAbs >= packetAbs + 1) {
-                break;
-            }
-            KeDelayExecutionThread(KernelMode, FALSE, &oneMs);
-        }
-        if (stream->m_LastOsWriteAbs < packetAbs + 1) {
-            InterlockedIncrement((volatile LONG*)&g_Underruns);
-        }
-    }
+    // The old 6 ms write wait lived here; the pump's data gate replaced it.
+    // The gate only lets a build through when the OS has already released
+    // the packet (FramesAvailable), and the pump never waits — the vendor
+    // pump has no wait either: no data, no URB, silent wire, re-anchor on
+    // the next build after the write arrives.
 
     // Continuous probe: both what the OS left in the ring (host int 24-in-32)
     // and what the conversion sent out (packed 24). The engine parks the pin
@@ -1610,7 +1665,37 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
             InterlockedExchange(&g_FillProbeDirty, 1);
         }
     }
-    return STATUS_SUCCESS;
+    return Frames;
+}
+
+#pragma code_seg()
+ULONGLONG NTAPI CEmuWaveStream::FramesAvailable(
+    _Inout_ PVOID Context,
+    _In_ ULONGLONG LinearFramePosition
+    )
+{
+    CEmuWaveStream* stream = (CEmuWaveStream*)Context;
+    ULONGLONG released;
+
+    if (stream == NULL || stream->m_NotificationCount == 0 ||
+        stream->m_NotificationFrames == 0) {
+        // No packet model: no write notification exists, so there is no gate
+        // to consult — the pump fills freely, exactly as the probe stream
+        // always has. The vendor analog has no such case (its KS ring always
+        // knows its fill).
+        return ~(ULONGLONG)0;
+    }
+    if (LinearFramePosition < stream->m_BaseFrames) {
+        return 0;
+    }
+    // The OS releases whole notification packets (SetWritePacket); frames
+    // past the last released packet boundary are not data yet. The pump
+    // builds only when at least one URB of them has been released, and the
+    // SetWritePacket overrun check (ahead > EMU_ISOCH_SLOTS) bounds how far
+    // ahead that can be.
+    released = stream->m_BaseFrames +
+        stream->m_LastOsWriteAbs * stream->m_NotificationFrames;
+    return released > LinearFramePosition ? released - LinearFramePosition : 0;
 }
 
 #pragma code_seg()
@@ -1646,6 +1731,32 @@ VOID NTAPI CEmuWaveStream::UsbPacketCompleted(
         }
     }
     KeReleaseSpinLock(&stream->m_NotificationLock, oldIrql);
+}
+
+#pragma code_seg("PAGE")
+VOID CEmuWaveStream::KickNotifications()
+{
+    PLIST_ENTRY entry;
+    KIRQL oldIrql;
+
+    PAGED_CODE();
+
+    if (m_NotificationCount == 0 || IsListEmpty(&m_NotificationList)) {
+        return;
+    }
+    KeAcquireSpinLock(&m_NotificationLock, &oldIrql);
+    for (entry = m_NotificationList.Flink; entry != &m_NotificationList;
+         entry = entry->Flink) {
+        PEMU_WAVE_NOTIFICATION notification = CONTAINING_RECORD(
+            entry, EMU_WAVE_NOTIFICATION, Link);
+        KeSetEvent(notification->Event, IO_NO_INCREMENT, FALSE);
+    }
+    KeReleaseSpinLock(&m_NotificationLock, oldIrql);
+    // One-shot wire verdict: the bootstrap fired, with which packet size.
+    if (InterlockedCompareExchange(&g_NotifKick, 1, 0) == 0) {
+        EmuNoteStatusValue(m_Context, L"NotifKick",
+                           (m_NotificationCount << 20) | m_NotificationFrames);
+    }
 }
 
 // --- Endpoint installation and teardown -------------------------------------

@@ -94,9 +94,10 @@ IsoPacket[i].Length @ URB+0x90+i*0xC
 ```
 
 x64-оффсеты URB_ISOCH_TRANSFER (сверены с WDK 26100): StartFrame@0x80,
-NumberOfPackets@0x84, IsoPacket[]@0x90 (12 Б/пакет). Драйвер пишет пакеты с
-базы 0x8C (его WDK-2007 раскладка без ErrorCount) — на современном стеке это
-означало бы сдвиг; **работает**, т.к. стеку хватает StartFrame/NumPackets/buffer.
+NumberOfPackets@0x84, ErrorCount@0x88, **IsoPacket[]@0x8C** (12 Б/пакет,
+sizeof(IsoPacket[1])=0x98). База 0x8C совпадает с современной — рассогласования
+нет; Length драйвера (0x98 + N*0xC) на один дескриптор больше требуемого
+(0x8C + N*0xC) — допустимо.
 
 **Resubmit**: `FUN_00019234` → `IoReuseIrp(irp)` + `IOCTL_INTERNAL_USB_SUBMIT_URB`
 (0x220003) вниз стека; URB-буфер используется повторно, но каждый раз

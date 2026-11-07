@@ -1,16 +1,17 @@
-// EmuUSBAudio — isochronous stream engine, M3 stage B (test slice).
+// EmuUSBAudio — isochronous stream engine, M3 stage B (vendor pump model).
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
-// The first vertical slice of kernel iso streaming, built on the alternates the
-// select-interface path now really selects: a fixed grid of one packet per USB
-// (milli)frame, EMU_ISOCH_SLOTS URBs in flight per direction, one packet per
-// URB, each re-armed by a per-direction system thread after its completion
-// event. Scheduling facts come from the pipe, not from assumptions: the period
-// is derived from USBD_PIPE_INFORMATION.Interval, and the nominal packet is
-// derived from the rate the caller asked for — this slice accepts only what it
-// can schedule exactly (integer frames per packet), which on the 0404 grid is
-// the /1000 Hz rates: 48000 in the test contract, 44100 waits for the M5
-// feedback engine.
+// One direction = one pump, after the disassembly of emusba10.sys
+// (FUN_000148A8, docs/ISOCH_PUMP.md): a bounded loop that builds and submits
+// URBs while a free slot exists and — for render — the data behind the URB is
+// already released by the OS. Nothing waits inside: no thread, no timers, no
+// events. The pump is called from the vendor's three event sites — data
+// arrival (the WaveRT SetWritePacket path, the analog of the vendor's KS ring
+// write), URB completion (DPC, where the re-arm happens with zero gap), and
+// start/resume. One global StartFrame cursor per stream advances +1 per URB
+// and is re-anchored to the bus on EVERY build (cursor <= now -> now + 3, the
+// vendor's invariant at 0x4DBE), so a stall of any length re-anchors the
+// schedule to the future instead of leaving the slots firing into the past.
 //
 // The pure scheduling helpers at the top are compiled twice (kernel image and
 // driver/utest.sh unit "isoch"), so the numbers the engine lives by are the
@@ -59,26 +60,66 @@ typedef struct _EMU_DEVICE_CONTEXT EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 // into its schedule).
 #define EMU_ISOCH_FRAME_MARGIN       3
 
+// Feedback endpoint reader: the vendor keeps TWO iso IN URBs in flight and
+// spaces consecutive StartFrames by exactly +32 (the trace's feedback delta).
+#define EMU_ISOCH_FB_SLOTS           2
+#define EMU_ISOCH_FB_STEP            32
+
+// Inline completions (IoCallDriver returning without STATUS_PENDING) re-enter
+// the pump on the same stack; a run this long means a deterministic rejection
+// or instant completions of past-scheduled URBs, and the pump leaves the rest
+// to the next event instead of spinning at DISPATCH.
+#define EMU_ISOCH_SYNC_SPIN_LIMIT    16
+
 // Frames of headroom in an IN slot: the device may deliver up to the pipe's
 // maximum, and the harvest reads what actually arrived.
 #define EMU_ISOCH_SLOT_HEADROOM      2
+
+// Slot lifecycle for the pump: FREE means the pump may arm it, ARMED means
+// an IRP is in flight. The ARMED -> FREE interlocked exchange decides which
+// of the competing reapers (the completion routine, the pump after a
+// synchronous completion) owns the harvest.
+#define EMU_ISOCH_SLOT_FREE          0
+#define EMU_ISOCH_SLOT_ARMED         1
 
 // The engine's owns-one-direction state. Lives inside EMU_DEVICE_CONTEXT, so
 // everything here is zeroed by IoCreateDevice and dies with the instance.
 #ifdef EMU_KERNEL
 
+typedef struct _EMU_ISOCH_STREAM EMU_ISOCH_STREAM, *PEMU_ISOCH_STREAM;
+
 typedef struct _EMU_ISOCH_SLOT {
     PIRP    Irp;            // allocated once, resubmitted per packet
-    PURB    Urb;            // USBD_IsochUrbAllocate, one packet
-    KEVENT  Done;           // signalled by the URB completion routine
-    ULONG   NextFrame;      // StartFrame for the next submission
-    BOOLEAN Submitted;      // whether the last submit is possibly in flight
+    PURB    Urb;            // USBD_IsochUrbAllocate, two packets
+    PEMU_ISOCH_STREAM Stream; // back-pointer for the completion routine
+    volatile LONG State;    // EMU_ISOCH_SLOT_FREE / EMU_ISOCH_SLOT_ARMED
 } EMU_ISOCH_SLOT, *PEMU_ISOCH_SLOT;
 
-typedef NTSTATUS (NTAPI *PEMU_ISOCH_FILL_RENDER)(
+typedef struct _EMU_ISOCH_FB_SLOT {
+    PIRP    Irp;
+    PURB    Urb;            // USBD_IsochUrbAllocate, one 4-byte packet
+    PUCHAR  Buffer;         // nonpaged, 8 bytes
+    PEMU_ISOCH_STREAM Stream;
+    volatile LONG State;    // EMU_ISOCH_SLOT_FREE / EMU_ISOCH_SLOT_ARMED
+} EMU_ISOCH_FB_SLOT, *PEMU_ISOCH_FB_SLOT;
+
+// Fill one packet's worth of frames into the USB transfer buffer, packed.
+// Returns the number of frames actually written (may be short on an underrun
+// — the URB then goes out with the actual length, as the vendor's builder
+// does), 0 when nothing went in and the URB must not be submitted.
+typedef ULONG (NTAPI *PEMU_ISOCH_FILL_RENDER)(
     _Inout_ PVOID Context,
     _Out_ PUCHAR Destination,
     _In_ ULONG Frames,
+    _In_ ULONGLONG LinearFramePosition
+    );
+
+// How many frames past LinearFramePosition the client has released for
+// consumption. The pump's data gate: below one URB of released data the pump
+// stops, and the wire stays silent until the next write packet (the vendor's
+// fill < need break at 0x4A60). DPC-safe: reads counters only.
+typedef ULONGLONG (NTAPI *PEMU_ISOCH_RENDER_AVAILABLE)(
+    _Inout_ PVOID Context,
     _In_ ULONGLONG LinearFramePosition
     );
 
@@ -87,17 +128,15 @@ typedef VOID (NTAPI *PEMU_ISOCH_RENDER_COMPLETED)(
     _In_ ULONGLONG CompletedFrames
     );
 
-typedef struct _EMU_ISOCH_STREAM {
-    BOOLEAN          Active;          // set once, cleared by the stop path
-    LONG             Quit;            // interlocked stop flag for the thread
+struct _EMU_ISOCH_STREAM {
+    BOOLEAN          Active;          // set under PumpLock, cleared on retire
+    volatile LONG    Quit;            // retire flag: no pump may arm anymore
     PVOID            Owner;           // the owning EMU_DEVICE_CONTEXT
     ULONG            Direction;       // EMU_STREAM_RENDER / EMU_STREAM_CAPTURE
-    PVOID            ThreadObject;    // referenced thread object, waited on stop
-    HANDLE           ThreadHandle;    // fallback until ObReferenceObject succeeds
     // Pipe facts, read out of the submitted select-interface URB's interface
     // information once at start and treated as read-only afterwards.
     USBD_PIPE_HANDLE Pipe;            // the data pipe (OUT 0x01 / IN 0x82)
-    USBD_PIPE_HANDLE FeedbackPipe;    // render only: 0x81, parked for M5
+    USBD_PIPE_HANDLE FeedbackPipe;    // render only: 0x81
     ULONG            MaxPacketSize;
     ULONG            PipeInterval;    // raw USBD_PIPE_INFORMATION.Interval
     ULONG            PeriodMs;        // legacy breadcrumb field; 1
@@ -107,32 +146,60 @@ typedef struct _EMU_ISOCH_STREAM {
     ULONG            RateHz;          // the rate the stream was armed at
     ULONG            BytesPerFrame;   // channels * subframe size (2*3 on 0404)
     ULONG            SlotBytes;       // per-slot buffer size
-    // Wall-clock pacing anchors: the controller on this machine completes iso
-    // URBs immediately regardless of StartFrame, so the worker holds each
-    // submission until its scheduled frame measured from these.
+    // The vendor pump model: one schedule cursor per stream, re-anchored to
+    // the bus on every build. The re-arm lives in the URB completion (DPC);
+    // Pending counts armed URBs and drains to zero on stop.
+    KSPIN_LOCK       PumpLock;        // serializes the pump, arming and retire
+    KEVENT           Idle;            // set when Pending drains to zero
+    volatile LONG    Pending;         // armed URBs, data + feedback
+    volatile ULONG   CursorFrame;     // data StartFrame cursor, +1 per URB
+    volatile ULONG   FbCursorFrame;   // feedback StartFrame cursor, +32 per URB
+    volatile LONG    Starved;         // set while the data gate blocks
+    volatile LONG    Underruns;       // gate-blocked pump passes since start
+    volatile LONG    Pumping;         // single-flight guard for the pump
+    volatile LONG    FbRearmDepth;    // bounds inline-completion re-arm chains
+    // Freeze forensics, flushed to the registry at stop: frame-query
+    // outcomes, the anchor's view of the bus, the pump's exit reasons.
+    volatile LONG    FqInline;        // real queries answered
+    volatile LONG    FqFloat;         // queries still pending after the wait
+    volatile LONG    FqFail;          // queries failed
+    volatile LONG    FqBusy;          // queries skipped (previous in flight)
+    volatile LONG    AnchorFires;     // cursor <= now re-anchors
+    volatile ULONG   NowLast;         // last anchor source value
+    volatile ULONG   CursorLast;      // data cursor after the last arm
+    volatile LONG    PumpQuitExit;    // pump exits: retired
+    volatile LONG    PumpPoolExit;    // pump exits: pool exhausted
+    volatile LONG    PumpGateExit;    // pump exits: data gate blocked
+    volatile LONG    PumpBuildExit;   // pump exits: build produced nothing
+    // Frame number source for the anchor: a dedicated GET_CURRENT_FRAME_NUMBER
+    // IRP the stack answers inline when possible, else the interrupt-time
+    // mapping calibrated at start and refreshed by every successful query.
+    PIRP             FrameIrp;
+    PURB             FrameUrb;
+    KEVENT           FrameEvent;
+    volatile LONG    FrameBusy;
     ULONGLONG        PaceOrigin;      // interrupt time at the frame query
     ULONGLONG        PaceBaseFrame;   // the frame number at that moment
     ULONG            FramesPerMs;     // calibrated counter units (1 = ms frames)
-    // Feedback reader: the 0404's OUT pipe is asynchronous and its DAC never
-    // locks unless the host services the feedback endpoint. A dedicated
-    // thread submits one 4-byte iso IN packet synchronously at a time; the
-    // device's own feedback interval paces it.
-    PURB             FbUrb;
-    PUCHAR           FbBuffer;
-    HANDLE           FbThreadHandle;
-    PVOID            FbThreadObject;
+    // Feedback reader: two asynchronous iso IN URBs, resubmitted from their
+    // own completion (DPC) with StartFrame = cursor + 32. Without an actively
+    // serviced feedback endpoint the asynchronous OUT sink never locks its
+    // DAC. The values themselves (the device's frame clock) are M5's input.
+    EMU_ISOCH_FB_SLOT Fb[EMU_ISOCH_FB_SLOTS];
     PUCHAR           Buffer;          // nonpaged, EMU_ISOCH_SLOTS * SlotBytes
     EMU_ISOCH_SLOT   Slots[EMU_ISOCH_SLOTS];
-    // WaveRT render callbacks. The worker fills from the host ring before every
-    // submit, including the prime pass, and reports only successful completions.
+    // WaveRT render callbacks. The pump fills from the host ring inside every
+    // build (prime included, only after the data gate passed) and reports
+    // successful completions.
     PVOID                       CallbackContext;
     PEMU_ISOCH_FILL_RENDER      FillRender;
+    PEMU_ISOCH_RENDER_AVAILABLE RenderAvailable;
     PEMU_ISOCH_RENDER_COMPLETED RenderCompleted;
     ULONGLONG                   BaseFrames;
     volatile LONGLONG           SubmittedFrames;
     volatile LONGLONG           CompletedFrames;
-    // Counters, all interlocked: the worker thread writes, the stats IOCTL
-    // reads, and neither holds a lock against the other.
+    // Counters, all interlocked: the pump and the completion routines write,
+    // the stats IOCTL reads, and neither holds a lock against the other.
     volatile LONG    Submits;
     volatile LONG    Completes;
     volatile LONG    UrbFailures;
@@ -141,7 +208,7 @@ typedef struct _EMU_ISOCH_STREAM {
     volatile LONG    Bytes;
     volatile LONG    LastUrbStatus;
     volatile LONG    LastPacketStatus;
-} EMU_ISOCH_STREAM, *PEMU_ISOCH_STREAM;
+};
 
 #endif // EMU_KERNEL
 
@@ -191,9 +258,11 @@ EmuIsochSlotBytes(
 // --- engine (kernel only) ----------------------------------------------------
 //
 // Start/stop are PASSIVE_LEVEL operations and serialize on the caller's
-// (StateLock): the start selects alternates and arms threads, the stop aborts
-// pipes and drains. The worker threads touch only stream-owned resources, so a
-// stop that holds the lock while waiting for them cannot deadlock.
+// (StateLock): the start selects alternates and primes the pump, the stop
+// retires the stream, aborts the pipes and drains Pending. The completion
+// routines touch only stream-owned resources, and the stop path waits for the
+// Pending drain before any storage is released, so nothing is freed while an
+// IRP of this engine can still be running.
 
 // Arm both directions for the M3 test contract: 48 kHz stereo, the alternates
 // EmuCapsFindAlt names, rate pushed through the existing SET path first.
@@ -207,7 +276,8 @@ EmuIsochStartStreams(
 
 // Start only the WaveRT render direction. StateLock must already be held.
 // BaseFrames is the paused stream's preserved host-ring position; the fill
-// callback receives monotonically increasing positions beginning there.
+// callback receives monotonically increasing positions beginning there and
+// the availability callback gates every build on released data.
 NTSTATUS
 EmuIsochStartRender(
     _Inout_ PEMU_DEVICE_CONTEXT       Ctx,
@@ -215,11 +285,13 @@ EmuIsochStartRender(
     _In_ ULONGLONG                    BaseFrames,
     _Inout_ PVOID                     CallbackContext,
     _In_ PEMU_ISOCH_FILL_RENDER       FillRender,
+    _In_ PEMU_ISOCH_RENDER_AVAILABLE  RenderAvailable,
     _In_ PEMU_ISOCH_RENDER_COMPLETED  RenderCompleted
     );
 
-// Stop render and wait for its worker. The completed count remains readable
-// after the stop so RUN -> PAUSE can preserve it in the WaveRT base position.
+// Stop render and wait for the Pending drain. The completed count remains
+// readable after the stop so RUN -> PAUSE can preserve it in the WaveRT base
+// position.
 VOID
 EmuIsochStopRender(
     _Inout_ PEMU_DEVICE_CONTEXT Ctx
@@ -238,6 +310,14 @@ EmuIsochRenderSubmittedFrames(
 // Stop both directions (idempotent; safe on a never-started instance).
 VOID
 EmuIsochStopAll(
+    _Inout_ PEMU_DEVICE_CONTEXT Ctx
+    );
+
+// The data-arrival pump kick: the WaveRT write-packet path calls it after the
+// OS has released a packet into the ring — the analog of the vendor's pump
+// call from its KS ring write. Any IRQL; a no-op on an inactive stream.
+VOID
+EmuIsochRenderDataReady(
     _Inout_ PEMU_DEVICE_CONTEXT Ctx
     );
 
