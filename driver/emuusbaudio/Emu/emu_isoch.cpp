@@ -117,26 +117,10 @@ EmuIsochSubmitSlot(
     PIO_STACK_LOCATION stack;
     NTSTATUS           status;
 
-    // Wall-clock pacing, no future scheduling: this USB stack never completes
-    // an iso URB whose StartFrame lies ahead (2.0.0.54 held the resubmissions
-    // until abort; only the prime's four packets ever completed) and burns
-    // through past-due ones instantly (2.0.0.51/52). The worker therefore
-    // submits each packet right at its scheduled slot - instant completion
-    // is expected - and the exact 100-ns wait below is what paces the wire to
-    // one packet per PeriodUs microseconds.
-    {
-        ULONGLONG nsPerPacket = (ULONGLONG)S->PeriodUs * 10;
-        ULONGLONG due = S->PaceOrigin +
-            (slot->NextFrame - S->PaceBaseFrame) * nsPerPacket;
-        ULONGLONG now = KeQueryInterruptTime();
-
-        if (now < due) {
-            LARGE_INTEGER delay;
-
-            delay.QuadPart = -(LONGLONG)(due - now);
-            KeDelayExecutionThread(KernelMode, FALSE, &delay);
-        }
-    }
+    // No worker-side pacing: the vendor model is submit-all-with-future-
+    // StartFrames and let the controller fire them on schedule (the .56-58
+    // wall-clock wait was a workaround for the .53-55 slot collisions and
+    // unit bug, both long fixed). The completion events are the metronome.
 
     IoReuseIrp(slot->Irp, STATUS_SUCCESS);
     KeClearEvent(&slot->Done);
@@ -196,7 +180,12 @@ EmuIsochArmUrb(
     }
 
     u->Hdr.Function = URB_FUNCTION_ISOCH_TRANSFER;
-    u->Hdr.Length = (USHORT)sizeof(struct _URB_ISOCH_TRANSFER);
+    // The URB must cover every packet descriptor: the base struct ends with
+    // IsoPacket[1], so a two-packet URB is one descriptor longer. 2.0.0.69
+    // declared NumberOfPackets=2 in a one-packet-sized URB and the stack
+    // silently dropped the second packet (every transfer "short").
+    u->Hdr.Length = (USHORT)(sizeof(struct _URB_ISOCH_TRANSFER) +
+        (EMU_ISOCH_PKTS_PER_URB - 1) * sizeof(USBD_ISO_PACKET_DESCRIPTOR));
     u->Hdr.Status = 0;
     u->PipeHandle = S->Pipe;
     u->TransferFlags = Out
@@ -204,18 +193,19 @@ EmuIsochArmUrb(
         : (USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK);
     u->TransferBuffer = transferBuffer;
     u->TransferBufferLength = Out ? packetBytes : S->SlotBytes;
-    // StartFrame = the current frame, computed from the calibrated pacing
-    // anchors. This stack's iso scheduling is broken at the extremes: a
-    // future StartFrame is held forever (2.0.0.54), and 2.0.0.61's StartFrame
-    // 0 (forty-nine days in the past on the frame counter) bugchecked the
-    // xHCI scheduling arithmetic on the first device attach. "Now" completes
-    // immediately and the worker's wall-clock wait produces the wire pace.
-    u->StartFrame = (ULONG)(S->PaceBaseFrame +
-        (KeQueryInterruptTime() - S->PaceOrigin) / 10000);
-    u->NumberOfPackets = 1;
-    u->IsoPacket[0].Offset = 0;
-    u->IsoPacket[0].Length = Out ? packetBytes : S->SlotBytes;
-    u->IsoPacket[0].Status = 0;
+    // StartFrame = the slot's scheduled frame (the vendor schedule: the
+    // anchor is current+3 at start, +1 frame per URB, eight URBs tile 8 ms
+    // ahead). The slot's wall-clock wait in SubmitSlot holds the submission
+    // until its frame; the USB stack takes it at the boundary.
+    u->StartFrame = Slot->NextFrame;
+    u->NumberOfPackets = EMU_ISOCH_PKTS_PER_URB;
+    for (ULONG p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
+        u->IsoPacket[p].Offset = p * (packetBytes / EMU_ISOCH_PKTS_PER_URB);
+        u->IsoPacket[p].Length = Out
+            ? packetBytes / EMU_ISOCH_PKTS_PER_URB
+            : S->SlotBytes / EMU_ISOCH_PKTS_PER_URB;
+        u->IsoPacket[p].Status = 0;
+    }
     // The slot stride is the whole pipeline: NextFrame is a packet index, and
     // the four slots tile it without overlap only when each advances by the
     // slot count. The old M3-B stride (PeriodMs) equaled the slot count by
@@ -306,10 +296,11 @@ EmuIsochHarvest(
 {
     struct _URB_ISOCH_TRANSFER* u = &Slot->Urb->UrbIsochronousTransfer;
     ULONG packetBytes = S->NominalFrames * S->BytesPerFrame;
-    ULONG got;
+    ULONG got = 0;
+    ULONG p;
     BOOLEAN irpSuccess = NT_SUCCESS(Slot->Irp->IoStatus.Status);
     BOOLEAN urbSuccess = NT_SUCCESS((NTSTATUS)u->Hdr.Status);
-    BOOLEAN packetSuccess = USBD_SUCCESS(u->IsoPacket[0].Status);
+    BOOLEAN allPacketsOk = TRUE;
 
     Slot->Submitted = FALSE;
     InterlockedIncrement(&S->Completes);
@@ -320,18 +311,21 @@ EmuIsochHarvest(
                             !irpSuccess ? (LONG)Slot->Irp->IoStatus.Status
                                         : (LONG)u->Hdr.Status);
     }
-    if (!packetSuccess) {
-        InterlockedIncrement(&S->IsoPacketErrors);
-        InterlockedExchange(&S->LastPacketStatus,
-                            (LONG)u->IsoPacket[0].Status);
+    for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
+        if (!USBD_SUCCESS(u->IsoPacket[p].Status)) {
+            InterlockedIncrement(&S->IsoPacketErrors);
+            InterlockedExchange(&S->LastPacketStatus,
+                                (LONG)u->IsoPacket[p].Status);
+            allPacketsOk = FALSE;
+        }
+        got += u->IsoPacket[p].Length;
     }
-    got = u->IsoPacket[0].Length;
     if (got < packetBytes) {
         InterlockedIncrement(&S->ShortPackets);
     }
     InterlockedAdd(&S->Bytes, (LONG)got);
 
-    if (Out && irpSuccess && urbSuccess && packetSuccess &&
+    if (Out && irpSuccess && urbSuccess && allPacketsOk &&
         got == packetBytes) {
         S->CompletedFrames += S->NominalFrames;
         if (S->RenderCompleted != NULL) {
@@ -797,21 +791,17 @@ EmuIsochStartStream(
         EmuIsochFreeStream(Ctx, Direction);
         return STATUS_INVALID_PARAMETER;
     }
-    // The wire grid follows the device's own bInterval: the 0404's streaming
-    // alternates carry bInterval 4 (high-speed microframes) = one iso
-    // transaction every 500 us, and the feedback endpoint reports 24 frames
-    // per that window (16.16 value 0x00180000 in the vendor trace). The CA0189
-    // hardware iso mechanism consumes FIFO on that schedule - 48-frame packets
-    // once per millisecond starve it (every earlier build, silent). The
-    // feedback thread services the endpoint continuously (2.0.0.65 sync
-    // reader, safe).
-    S->PeriodUs = S->PipeInterval * 125;
-    if (S->PeriodUs == 0 || S->PeriodUs > 1000) {
-        S->PeriodUs = 500;
-    }
-    S->FramesPerPacket = RateHz * S->PeriodUs / 1000000;
-    if (S->FramesPerPacket == 0) {
-        S->FramesPerPacket = 1;
+    // The wire grid, byte-for-byte the vendor's (trace + disassembly of
+    // emusba10): each URB covers ONE millisecond frame and carries TWO
+    // 24-frame packets (microframes 0 and 4 of the bInterval=3 endpoint; the
+    // USBD PipeInformation.Interval reads 4 = microframes per packet), the
+    // schedule leads the current frame by 3, eight URBs in flight, one frame
+    // step per URB. The feedback endpoint reports 24 frames per 500-us window
+    // (16.16 value 0x00180000) and is serviced by its own thread.
+    S->PeriodUs = 1000;
+    S->FramesPerPacket = RateHz / 1000;   // 48: frames per URB (both packets)
+    if (S->FramesPerPacket < EMU_ISOCH_PKTS_PER_URB) {
+        S->FramesPerPacket = EMU_ISOCH_PKTS_PER_URB;
     }
     S->NominalFrames = S->FramesPerPacket;
     S->PeriodMs = 1;   // legacy breadcrumb field
@@ -853,7 +843,8 @@ EmuIsochStartStream(
 
         RtlZeroMemory(slot, sizeof(*slot));
         KeInitializeEvent(&slot->Done, NotificationEvent, FALSE);
-        status = USBD_IsochUrbAllocate(Ctx->UsbdHandle, 1, &slot->Urb);
+        status = USBD_IsochUrbAllocate(Ctx->UsbdHandle,
+                                       EMU_ISOCH_PKTS_PER_URB, &slot->Urb);
         if (!NT_SUCCESS(status)) {
             EmuIsochFreeStream(Ctx, Direction);
             return status;
@@ -919,7 +910,7 @@ EmuIsochStartStream(
     S->PaceBaseFrame = frameUrb->UrbGetCurrentFrameNumber.FrameNumber;
     USBD_UrbFree(Ctx->UsbdHandle, frameUrb);
     for (ULONG i = 0; i < EMU_ISOCH_SLOTS; i++) {
-        S->Slots[i].NextFrame = base + i * S->PeriodMs;
+        S->Slots[i].NextFrame = base + i;   // one frame step per URB
     }
     // The wire verdict: the first StartFrame, for correlating a bus trace.
     EmuNoteStatusValue(Ctx, Direction == EMU_STREAM_RENDER
@@ -948,6 +939,28 @@ EmuIsochStartStream(
     }
 
     S->Active = TRUE;
+
+    // SYNC_RESET_PIPE_AND_CLEAR_STALL on both pipes before the first URB:
+    // the vendor start sequence does exactly this (FUN_00019B20), dropping
+    // whatever controller state the previous driver session left behind.
+    {
+        PURB resetUrb = NULL;
+
+        if (NT_SUCCESS(USBD_UrbAllocate(Ctx->UsbdHandle, &resetUrb))) {
+            resetUrb->UrbPipeRequest.Hdr.Function =
+                URB_FUNCTION_SYNC_RESET_PIPE_AND_CLEAR_STALL;
+            resetUrb->UrbPipeRequest.Hdr.Length =
+                (USHORT)sizeof(struct _URB_PIPE_REQUEST);
+            resetUrb->UrbPipeRequest.Hdr.Status = 0;
+            resetUrb->UrbPipeRequest.PipeHandle = S->Pipe;
+            (VOID)EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, resetUrb);
+            if (S->FeedbackPipe != NULL) {
+                resetUrb->UrbPipeRequest.PipeHandle = S->FeedbackPipe;
+                (VOID)EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, resetUrb);
+            }
+            USBD_UrbFree(Ctx->UsbdHandle, resetUrb);
+        }
+    }
     InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
     status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, &oa, NULL,
                                   NULL, EmuIsochWorker, S);

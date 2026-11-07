@@ -47,15 +47,17 @@ typedef LONG NTSTATUS;
 // context. A forward declaration breaks the cycle; nothing here dereferences.
 typedef struct _EMU_DEVICE_CONTEXT EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 
-// URBs in flight per direction. Four packets (16 ms) keep the wire covered
-// while staying inside the audio engine's write lookahead: the OS writes the
-// ring a few packets past the consumed cursor, and a deeper pipeline would
-// read packets the engine has not filled yet (silent output).
-#define EMU_ISOCH_SLOTS              4
+// URBs in flight per direction: the vendor trace and the disassembly of
+// emusba10 agree on eight (the schedule covers 8 ms ahead; the start anchor
+// is the current frame + 3). Each URB carries TWO 24-frame packets inside one
+// millisecond frame (microframes 0 and 4 of the bInterval=3 endpoint).
+#define EMU_ISOCH_SLOTS              8
+#define EMU_ISOCH_PKTS_PER_URB       2
 
-// StartFrame of the first packet: this many frames past the current frame
-// number, the reserve v1 used (the submission itself takes a few frames).
-#define EMU_ISOCH_FRAME_MARGIN       8
+// StartFrame of the first packet: the vendor sync anchor (GET Id 0x10002
+// returns GET_CURRENT_FRAME_NUMBER + 3; the RUN transition writes the same
+// into its schedule).
+#define EMU_ISOCH_FRAME_MARGIN       3
 
 // Frames of headroom in an IN slot: the device may deliver up to the pipe's
 // maximum, and the harvest reads what actually arrived.

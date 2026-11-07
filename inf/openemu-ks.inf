@@ -12,7 +12,7 @@ Class       = Media
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = openemu-ks.cat
-DriverVer   = 11/07/2026,2.0.0.68
+DriverVer   = 11/07/2026,2.0.0.70
 PnpLockdown = 1
 
 [SourceDisksNames]

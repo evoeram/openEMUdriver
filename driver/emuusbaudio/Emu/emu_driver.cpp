@@ -141,7 +141,7 @@ extern "C" NTSTATUS DriverEntry(
         EmuDriverRegistryPath.MaximumLength =
             (USHORT)sizeof(g_RegistryPathBuffer);
         EmuDriverRegistryPath.Buffer = g_RegistryPathBuffer;
-        EmuNoteStatusValue(NULL, L"EntryBread", 0x00000044);
+        EmuNoteStatusValue(NULL, L"EntryBread", 0x00000046);
     }
     EmuReadTraceLevel(RegistryPath);
 
