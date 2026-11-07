@@ -170,4 +170,35 @@ EmuCtrlBuildSpdifFormatSet(
     _In_ ULONG Format
     );
 
+// Standard USB audio feature-unit control selectors (the E-MU feature unit
+// is an ordinary one, unlike its vendor XU units).
+#define EMU_FEATURE_CS_MUTE    0x01
+#define EMU_FEATURE_CS_VOLUME  0x02
+#define EMU_FEATURE_CTRL_MUTE  0x01
+
+// Feature unit, master channel: SET_CUR mute = 0. The device keeps mute in
+// its own nonvolatile state and carries no USB volume - the front-panel knob
+// is the only gain - so a device that last met the stock panel muted stays
+// silent through any stream until something writes this.
+NTSTATUS
+EmuCtrlBuildMuteOff(
+    _Out_ PEMU_CTRL_REQUEST Request,
+    _In_ ULONG FeatureUnitId,
+    _In_ ULONG AcInterface
+    );
+
+// Feature unit, given channel: SET_CUR volume, signed 1/256-dB, two bytes
+// (0x0000 = 0 dB). The per-channel volume controls live on channels 1..N;
+// the device keeps their values in nonvolatile memory, and a device last
+// seen by the stock panel at -inf volume is silent through any stream
+// despite the master unmute.
+NTSTATUS
+EmuCtrlBuildVolumeSet(
+    _Out_ PEMU_CTRL_REQUEST Request,
+    _In_ ULONG FeatureUnitId,
+    _In_ ULONG AcInterface,
+    _In_ ULONG Channel,
+    _In_ SHORT Volume
+    );
+
 #endif // _EMU_CTRL_H_

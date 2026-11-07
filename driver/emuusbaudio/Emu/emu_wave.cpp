@@ -503,11 +503,20 @@ static ULONG g_DriLastStatus;
 // Silence probe: what actually left the host in the first packet after RUN.
 // Armed by SetState(KSSTATE_RUN) (PASSIVE), sampled by FillUsbPacket
 // (DISPATCH_LEVEL), flushed to the registry by GetPosition (PASSIVE).
-static volatile LONG g_FillProbeArmed;
+extern const char g_OedProbeMark[] = "OEDPROBE46";  // ASCII build marker of the probe source
 static volatile LONG g_FillProbeDirty;
 static ULONG g_FillNonZero;
 static ULONG g_FillSig0;
 static ULONG g_FillSig1;
+static ULONG g_HostNonZero;
+static ULONG g_HostSig0;
+static ULONG g_HostSig1;
+static ULONG g_ProbeSampled;   // LinearFramePosition low 32 of the sampled fill
+static ULONG g_FillCalls;   // FillUsbPacket invocations - zero means the pattern feeds the wire
+static ULONG g_ArmTicks;       // SetState(RUN) arm executions, fresh per boot
+static volatile LONG g_FillSeen;      // one-shot: first FillUsbPacket entry
+static volatile LONG g_FillRejected;  // one-shot: first validation rejection
+static volatile LONG g_PosIrql;       // highest IRQL GetPosition was seen at
 static ULONG g_Underruns;
 
 #pragma code_seg("PAGE")
@@ -1245,13 +1254,28 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::GetPosition(
     Position->WriteOffset = ring;
 
     // Flush the silence probe (PASSIVE): what left the host in the first
-    // packet after the last RUN transition.
-    if (InterlockedCompareExchange(&g_FillProbeDirty, 0, 1) == 1) {
-        EmuNoteStatusValue(NULL, L"FillNonZero", g_FillNonZero);
-        EmuNoteStatusValue(NULL, L"FillSig0", g_FillSig0);
-        EmuNoteStatusValue(NULL, L"FillSig1", g_FillSig1);
+    // packet after the last RUN transition. GetPosition is reachable at
+    // DISPATCH_LEVEL; there the consume must not happen - the registry write
+    // would fail silently and the probe data would be lost for good. The
+    // whole flush tail is registry writes, so it sits behind the same gate.
+    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        InterlockedExchange(&g_PosIrql, (LONG)KeGetCurrentIrql());
+    } else {
+        if (InterlockedCompareExchange(&g_FillProbeDirty, 0, 1) == 1) {
+            EmuNoteStatusValue(NULL, L"PosFlush", 0x10000001);
+            EmuNoteStatusValue(NULL, L"FillNonZero", g_FillNonZero);
+            EmuNoteStatusValue(NULL, L"FillSig0", g_FillSig0);
+            EmuNoteStatusValue(NULL, L"FillSig1", g_FillSig1);
+            EmuNoteStatusValue(NULL, L"HostNonZero", g_HostNonZero);
+            EmuNoteStatusValue(NULL, L"HostSig0", g_HostSig0);
+            EmuNoteStatusValue(NULL, L"HostSig1", g_HostSig1);
+            EmuNoteStatusValue(NULL, L"ProbeSampled", g_ProbeSampled);
+        }
+        EmuNoteStatusValue(NULL, L"FillCalls", g_FillCalls);
+        EmuNoteStatusValue(NULL, L"ArmTicks", g_ArmTicks);
+        EmuNoteStatusValue(NULL, L"Underruns", g_Underruns);
+        EmuNoteStatusValue(NULL, L"PosIrql", g_PosIrql);
     }
-    EmuNoteStatusValue(NULL, L"Underruns", g_Underruns);
     return STATUS_SUCCESS;
 }
 
@@ -1305,8 +1329,14 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetWritePacket(
             EmuNoteStatusValue(NULL, L"FillNonZero", g_FillNonZero);
             EmuNoteStatusValue(NULL, L"FillSig0", g_FillSig0);
             EmuNoteStatusValue(NULL, L"FillSig1", g_FillSig1);
+            EmuNoteStatusValue(NULL, L"HostNonZero", g_HostNonZero);
+            EmuNoteStatusValue(NULL, L"HostSig0", g_HostSig0);
+            EmuNoteStatusValue(NULL, L"HostSig1", g_HostSig1);
+        EmuNoteStatusValue(NULL, L"ProbeSampled", g_ProbeSampled);
         }
-        EmuNoteStatusValue(NULL, L"Underruns", g_Underruns);
+        EmuNoteStatusValue(NULL, L"FillCalls", g_FillCalls);
+        EmuNoteStatusValue(NULL, L"ArmTicks", g_ArmTicks);
+EmuNoteStatusValue(NULL, L"Underruns", g_Underruns);
     }
     return STATUS_SUCCESS;
 }
@@ -1381,6 +1411,26 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetState(_In_ KSSTATE State)
     switch (State) {
     case KSSTATE_STOP:
         EmuIsochStopRender(m_Context);
+        // The guaranteed PASSIVE flush of the silence probe: event-driven
+        // clients can run a whole stream without touching the packet-model
+        // callback at PASSIVE, and then nothing else reports what the fill
+        // actually sent.
+        if (InterlockedCompareExchange(&g_FillProbeDirty, 0, 1) == 1) {
+            EmuNoteStatusValue(m_Context, L"FillNonZero", g_FillNonZero);
+            EmuNoteStatusValue(m_Context, L"FillSig0", g_FillSig0);
+            EmuNoteStatusValue(m_Context, L"FillSig1", g_FillSig1);
+            EmuNoteStatusValue(m_Context, L"HostNonZero", g_HostNonZero);
+            EmuNoteStatusValue(m_Context, L"HostSig0", g_HostSig0);
+            EmuNoteStatusValue(m_Context, L"HostSig1", g_HostSig1);
+            EmuNoteStatusValue(m_Context, L"ProbeSampled", g_ProbeSampled);
+        }
+        // Proves this flush ran at all: the probe keys being absent with
+        // StopFlush present means the probe never sampled, not that the stop
+        // path was skipped.
+        EmuNoteStatusValue(m_Context, L"StopFlush", 0x10000001);
+        EmuNoteStatusValue(m_Context, L"FillCalls", g_FillCalls);
+        EmuNoteStatusValue(m_Context, L"ArmTicks", g_ArmTicks);
+EmuNoteStatusValue(m_Context, L"Underruns", g_Underruns);
         m_BaseFrames = 0;
         m_NextNotificationFrame = m_NotificationFrames;
         m_LastOsWriteAbs = 0;
@@ -1412,8 +1462,13 @@ STDMETHODIMP_(NTSTATUS) CEmuWaveStream::SetState(_In_ KSSTATE State)
             status = EmuIsochStartRender(
                 m_Context, EMU_AUDIO_M4_RATE_HZ, m_BaseFrames,
                 this, FillUsbPacket, UsbPacketCompleted);
+            // Probe instrumentation: was the arm site reached at all, and with
+            // which start verdict - the silence probe never sampled while the
+            // stream demonstrably ran, so every step of its chain gets a wire
+            // verdict now.
+            EmuNoteStatusValue(m_Context, L"ProbeArm", (ULONG)status | 0x10000000);
             if (NT_SUCCESS(status)) {
-                InterlockedExchange(&g_FillProbeArmed, 1);
+                InterlockedIncrement((volatile LONG*)&g_ArmTicks);
             }
         }
         break;
@@ -1446,6 +1501,20 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
     ULONG spanCount;
     ULONG hostFrameBytes = EMU_AUDIO_M4_CHANNELS * EMU_AUDIO_HOST_SAMPLE_BYTES;
 
+    // Probe instrumentation: if this counter stays at zero while the stream
+    // submits, the wire is fed by the prime-pass pattern, not by the client.
+    InterlockedIncrement((volatile LONG*)&g_FillCalls);
+
+    // One-shot direct registry writes from the worker (PASSIVE): they bypass
+    // the Dirty/flush indirection entirely. If FillSeen appears but the
+    // probe's ProbeLive does not, the divergence is inside this function.
+    if (InterlockedCompareExchange(&g_FillSeen, 1, 0) == 0) {
+        EmuNoteStatusValue(NULL, L"FillSeen", (ULONG)LinearFramePosition);
+        EmuNoteStatusValue(NULL, L"FillSeenFrames", Frames);
+        EmuNoteStatusValue(NULL, L"FillSeenBuffer", stream != NULL
+                               ? stream->m_BufferBytes : 0);
+    }
+
     if (stream == NULL || Destination == NULL || Frames == 0 ||
         stream->m_Buffer == NULL ||
         LinearFramePosition > (~(ULONGLONG)0) / hostFrameBytes ||
@@ -1453,6 +1522,16 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
         !EmuAudioRingSpans(LinearFramePosition * hostFrameBytes,
                            stream->m_BufferBytes, hostFrameBytes, Frames,
                            spans, &spanCount)) {
+        // One-shot: the worker keeps calling with parameters this fill
+        // rejects. The submit counters growing alongside this value would
+        // mean the data gate never sees this function succeed.
+        if (InterlockedCompareExchange(&g_FillRejected, 1, 0) == 0) {
+            EmuNoteStatusValue(NULL, L"FillRejected", Frames);
+            EmuNoteStatusValue(NULL, L"FillRejectedPos",
+                               (ULONG)LinearFramePosition);
+            EmuNoteStatusValue(NULL, L"FillRejectedBuf", stream != NULL
+                                   ? stream->m_BufferBytes : 0);
+        }
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1489,25 +1568,47 @@ NTSTATUS NTAPI CEmuWaveStream::FillUsbPacket(
         }
     }
 
-    // One-shot probe of the first packed packet after a RUN transition:
-    // nonzero-byte count and the first 8 packed bytes. Sampled here
-    // (DISPATCH_LEVEL), flushed to the registry from GetPosition (PASSIVE).
-    if (LinearFramePosition == stream->m_BaseFrames &&
-        InterlockedCompareExchange(&g_FillProbeArmed, 0, 1) == 1) {
+    // Continuous probe: both what the OS left in the ring (host int 24-in-32)
+    // and what the conversion sent out (packed 24). The engine parks the pin
+    // between clients, so a one-shot-per-RUN sample kept describing the boot
+    // idle stream instead of the tone - sample every fill instead (two
+    // 1152-byte scans, nothing on the worker), keep the latest signatures in
+    // the globals, and arm the flush once a second (48000 fills on the 1 ms
+    // grid). The flush sites are PASSIVE-gated; the worker is PASSIVE.
+    {
         PUCHAR packed = (PUCHAR)Destination -
             Frames * EMU_AUDIO_M4_CHANNELS * EMU_AUDIO_USB_SAMPLE_BYTES;
-        ULONG nz = 0;
-        for (ULONG b = 0; b < Frames * 6; b++) {
+        PUCHAR host = stream->m_Buffer + spans[0].Offset;
+        ULONG packedBytes = Frames * EMU_AUDIO_M4_CHANNELS *
+            EMU_AUDIO_USB_SAMPLE_BYTES;
+        ULONG hostBytes = spans[0].Bytes;   // span 0 only: wraps are irrelevant
+        ULONG nzPacked = 0;
+        ULONG nzHost = 0;
+
+        for (ULONG b = 0; b < packedBytes; b++) {
             if (packed[b] != 0) {
-                nz++;
+                nzPacked++;
             }
         }
-        g_FillNonZero = nz;
+        for (ULONG b = 0; b < hostBytes; b++) {
+            if (host[b] != 0) {
+                nzHost++;
+            }
+        }
+        g_FillNonZero = nzPacked;
         g_FillSig0 = (ULONG)packed[0] | ((ULONG)packed[1] << 8) |
                      ((ULONG)packed[2] << 16) | ((ULONG)packed[3] << 24);
         g_FillSig1 = (ULONG)packed[4] | ((ULONG)packed[5] << 8) |
                      ((ULONG)packed[6] << 16) | ((ULONG)packed[7] << 24);
-        InterlockedExchange(&g_FillProbeDirty, 1);
+        g_HostNonZero = nzHost;
+        g_HostSig0 = (ULONG)host[0] | ((ULONG)host[1] << 8) |
+                     ((ULONG)host[2] << 16) | ((ULONG)host[3] << 24);
+        g_HostSig1 = (ULONG)host[4] | ((ULONG)host[5] << 8) |
+                     ((ULONG)host[6] << 16) | ((ULONG)host[7] << 24);
+        g_ProbeSampled = (ULONG)LinearFramePosition;
+        if ((g_FillCalls % 2400) == 0) {
+            InterlockedExchange(&g_FillProbeDirty, 1);
+        }
     }
     return STATUS_SUCCESS;
 }

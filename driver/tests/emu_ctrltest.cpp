@@ -194,6 +194,14 @@ CaseSetCurWire(void)
     CheckStatus("mute-set-build", STATUS_SUCCESS, status);
     ExpectSetup("mute-set-master", &r, EMU_CTRL_REQUEST_TYPE_OUT,
                 UNIT_FEATURE, AC_IFACE, EMU_FU_CS_MUTE, 1, 1);
+
+    // The dedicated mute-off builder the render start uses: master channel is
+    // index 0 per USB audio (bmaControls[0]), payload 0x00 = unmute.
+    status = EmuCtrlBuildMuteOff(&r, UNIT_FEATURE, AC_IFACE);
+    CheckStatus("mute-off-build", STATUS_SUCCESS, status);
+    ExpectSetup("mute-off-master", &r, EMU_CTRL_REQUEST_TYPE_OUT,
+                UNIT_FEATURE, AC_IFACE, EMU_FU_CS_MUTE, 0, 1);
+    CHECK_EQ(r.Payload[0], 0);
 }
 
 static void

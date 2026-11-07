@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <endpointvolume.h>
 #include <stdio.h>
 #include <math.h>
 
@@ -115,6 +116,11 @@ int wmain(int argc, wchar_t** argv) {
 
     bool play = argc >= 3 && !wcscmp(argv[1], L"-p");
     int target = play ? _wtoi(argv[2]) : -1;
+    // -vol (after -p <idx>): force the endpoint master volume to 100% and
+    // unmute before playing. With no hardware volume node in our topology,
+    // Windows attenuates in software - a zero or muted endpoint means zeros
+    // in the WaveRT ring while every USB counter stays perfect.
+    bool setvol = argc >= 4 && !wcscmp(argv[3], L"-vol");
 
     IMMDeviceCollection* coll = nullptr;
     hr = en->EnumAudioEndpoints(eRender, DEVICE_STATEMASK_ALL, &coll);
@@ -169,6 +175,35 @@ int wmain(int argc, wchar_t** argv) {
             printf("endpoint [%d] is not ACTIVE (state bits 0x%08lX); enable it in Sound control panel\n",
                    target, (unsigned long)state);
             return 3;
+        }
+        // Endpoint master volume: the software-attenuation path lives in the
+        // audio engine, so the slider state decides what reaches the ring -
+        // print it, and with -vol force 100% / unmuted.
+        {
+            static const IID k_IID_IAudioEndpointVolume = {
+                0x5cdf2c82, 0x841e, 0x4546,
+                { 0x97, 0x28, 0x0c, 0xf0, 0x37, 0x0f, 0xc6, 0x25 } };
+            IAudioEndpointVolume* ev = nullptr;
+            HRESULT ve = d->Activate(k_IID_IAudioEndpointVolume, CLSCTX_ALL,
+                                     nullptr, (void**)&ev);
+            if (SUCCEEDED(ve)) {
+                BOOL muted = FALSE; float level = 0.f;
+                ev->GetMute(&muted);
+                ev->GetMasterVolumeLevelScalar(&level);
+                printf("endpoint volume: %.0f%%, muted=%s\n",
+                       level * 100.f, muted ? "yes" : "no");
+                if (setvol) {
+                    ev->SetMute(FALSE, nullptr);
+                    ev->SetMasterVolumeLevelScalar(1.0f, nullptr);
+                    ev->GetMasterVolumeLevelScalar(&level);
+                    ev->GetMute(&muted);
+                    printf("endpoint volume set: %.0f%%, muted=%s\n",
+                           level * 100.f, muted ? "yes" : "no");
+                }
+                ev->Release();
+            } else {
+                printf("endpointvolume activate hr=0x%08lX\n", (unsigned long)ve);
+            }
         }
         IAudioClient* ac = nullptr;
         hr = d->Activate(k_IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&ac);

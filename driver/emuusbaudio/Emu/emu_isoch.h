@@ -98,11 +98,27 @@ typedef struct _EMU_ISOCH_STREAM {
     USBD_PIPE_HANDLE FeedbackPipe;    // render only: 0x81, parked for M5
     ULONG            MaxPacketSize;
     ULONG            PipeInterval;    // raw USBD_PIPE_INFORMATION.Interval
-    ULONG            PeriodMs;        // derived; 1 on the 0404 grid
+    ULONG            PeriodMs;        // legacy breadcrumb field; 1
+    ULONG            PeriodUs;        // packet period in microseconds (HS grid)
+    ULONG            FramesPerPacket; // frames in one wire packet
     ULONG            NominalFrames;   // frames per packet at this rate
     ULONG            RateHz;          // the rate the stream was armed at
     ULONG            BytesPerFrame;   // channels * subframe size (2*3 on 0404)
     ULONG            SlotBytes;       // per-slot buffer size
+    // Wall-clock pacing anchors: the controller on this machine completes iso
+    // URBs immediately regardless of StartFrame, so the worker holds each
+    // submission until its scheduled frame measured from these.
+    ULONGLONG        PaceOrigin;      // interrupt time at the frame query
+    ULONGLONG        PaceBaseFrame;   // the frame number at that moment
+    ULONG            FramesPerMs;     // calibrated counter units (1 = ms frames)
+    // Feedback reader: the 0404's OUT pipe is asynchronous and its DAC never
+    // locks unless the host services the feedback endpoint. A dedicated
+    // thread submits one 4-byte iso IN packet synchronously at a time; the
+    // device's own feedback interval paces it.
+    PURB             FbUrb;
+    PUCHAR           FbBuffer;
+    HANDLE           FbThreadHandle;
+    PVOID            FbThreadObject;
     PUCHAR           Buffer;          // nonpaged, EMU_ISOCH_SLOTS * SlotBytes
     EMU_ISOCH_SLOT   Slots[EMU_ISOCH_SLOTS];
     // WaveRT render callbacks. The worker fills from the host ring before every

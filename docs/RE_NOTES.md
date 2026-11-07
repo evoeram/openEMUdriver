@@ -25,11 +25,12 @@ AudioControl + AudioStreaming out + AudioStreaming in (+MIDI).
 - `emasio.dll` — COM-сервер ASIO: `KsCreatePin` (ksuser) — поток через KS-пины ядра;
   управление — `DeviceIoControl` с приватным IOCTL **0x2f0003** на handle устройства.
 - Панель (`EmuUsbAudioCPServices.dll`, класс `CHulaServices`/`CreateHulaServices`) —
-  тот же IOCTL 0x2f0003; вход — структура KSPROPERTY
-  { GUID **{F6D7C04D-C5C3-4181-…79EFFDD0CBE}**, Id, Flags } (+ payload при SET),
-  флаги: 1=GET, 2=SET, 0x10000001/0x10000002 — расширенные SET.
-  Примеры Id: GET 1-байт статуса, GET 32 байт (метры), GET 0x12 байт + SET 276 байт
-  строки (ник устройства).
+  тот же IOCTL 0x2f0003 (= IOCTL_KS_PROPERTY); вход — структура KSPROPERTY
+  { GUID **{F6D7C04D-C5C3-4181-9ED7-504ABE0CDDFF}**, Id, Flags } (+ payload),
+  флаги: 1=GET, 2=SET, 0x10000001/0x10000002 = KSPROPERTY_TYPE_TOPOLOGY|GET/SET
+  (узловой уровень KSP_NODE, наборы {26BB0000|XUcode-PID-VID-…}).
+  Полный реверс: **docs/PANEL_IOCTL.md** (таблицы Id 0-7/0x20/0x21/0x10000-10002,
+  payload-раскладки, URB/EP0 слой, {26BBExx}→XU мост, INI-ключи).
 - `emaudsv.exe` — служба-арбитр (автозапуск), DeviceIoControl + PnP-нотификации.
 
 ## Данные

@@ -14,6 +14,7 @@
 // A slot whose final completion never arrives is deliberately leaked rather
 // than freed; the alternative is freeing memory an IRP still references.
 #include "emu_isoch.h"
+#include <ntstrsafe.h>
 
 // --- pure scheduling helpers -------------------------------------------------
 // (nonpaged in the image: the worker calls them per submission and the start
@@ -116,6 +117,27 @@ EmuIsochSubmitSlot(
     PIO_STACK_LOCATION stack;
     NTSTATUS           status;
 
+    // Wall-clock pacing, no future scheduling: this USB stack never completes
+    // an iso URB whose StartFrame lies ahead (2.0.0.54 held the resubmissions
+    // until abort; only the prime's four packets ever completed) and burns
+    // through past-due ones instantly (2.0.0.51/52). The worker therefore
+    // submits each packet right at its scheduled slot - instant completion
+    // is expected - and the exact 100-ns wait below is what paces the wire to
+    // one packet per PeriodUs microseconds.
+    {
+        ULONGLONG nsPerPacket = (ULONGLONG)S->PeriodUs * 10;
+        ULONGLONG due = S->PaceOrigin +
+            (slot->NextFrame - S->PaceBaseFrame) * nsPerPacket;
+        ULONGLONG now = KeQueryInterruptTime();
+
+        if (now < due) {
+            LARGE_INTEGER delay;
+
+            delay.QuadPart = -(LONGLONG)(due - now);
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+    }
+
     IoReuseIrp(slot->Irp, STATUS_SUCCESS);
     KeClearEvent(&slot->Done);
     stack = IoGetNextIrpStackLocation(slot->Irp);
@@ -123,12 +145,15 @@ EmuIsochSubmitSlot(
     // AssignUrbToIoStackLocation writes both the URB pointer and the
     // IOCTL_INTERNAL_USB_SUBMIT_URB control code into the location.
     USBD_AssignUrbToIoStackLocation(Ctx->UsbdHandle, stack, slot->Urb);
-    status = IoSetCompletionRoutineEx(Ctx->Pdo, slot->Irp,
-                                      EmuIsochCompletion, &slot->Done,
-                                      TRUE, TRUE, TRUE);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
+    // The classic (non-Ex) registration: the routine only signals the slot's
+    // event, which is legal at any IRQL, and the worker always waits for it.
+    // The Ex variant queues a special APC for PASSIVE execution, and when the
+    // USB stack completes a failed URB synchronously inside IoCallDriver that
+    // APC insert bugchecked (the 2.0.0.61 attach crash,
+    // KeInsertQueueApc under IopfCompleteRequest).
+    IoSetCompletionRoutine(slot->Irp, EmuIsochCompletion, &slot->Done,
+                           TRUE, TRUE, TRUE);
+    status = STATUS_SUCCESS;
 
     slot->Submitted = TRUE;
     InterlockedIncrement(&S->Submits);
@@ -179,13 +204,94 @@ EmuIsochArmUrb(
         : (USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK);
     u->TransferBuffer = transferBuffer;
     u->TransferBufferLength = Out ? packetBytes : S->SlotBytes;
-    u->StartFrame = Slot->NextFrame;
+    // StartFrame = the current frame, computed from the calibrated pacing
+    // anchors. This stack's iso scheduling is broken at the extremes: a
+    // future StartFrame is held forever (2.0.0.54), and 2.0.0.61's StartFrame
+    // 0 (forty-nine days in the past on the frame counter) bugchecked the
+    // xHCI scheduling arithmetic on the first device attach. "Now" completes
+    // immediately and the worker's wall-clock wait produces the wire pace.
+    u->StartFrame = (ULONG)(S->PaceBaseFrame +
+        (KeQueryInterruptTime() - S->PaceOrigin) / 10000);
     u->NumberOfPackets = 1;
     u->IsoPacket[0].Offset = 0;
     u->IsoPacket[0].Length = Out ? packetBytes : S->SlotBytes;
     u->IsoPacket[0].Status = 0;
-    Slot->NextFrame += S->PeriodMs;
+    // The slot stride is the whole pipeline: NextFrame is a packet index, and
+    // the four slots tile it without overlap only when each advances by the
+    // slot count. The old M3-B stride (PeriodMs) equaled the slot count by
+    // accident and 2.0.0.51's one-millisecond period made every slot claim
+    // the same packets as its neighbour - the second URB for a packet window
+    // is held by the controller forever and the worker froze after the prime.
+    Slot->NextFrame += EMU_ISOCH_SLOTS;
     return STATUS_SUCCESS;
+}
+
+// The feedback reader: one 4-byte iso IN packet on the feedback endpoint,
+// submitted ASAP and rearmed by the worker whenever it completes. The
+// asynchronous OUT sink never locks its DAC unless this endpoint is being
+// serviced - the 2.0.0.23..2.0.0.58 silence had every other wire parameter
+// matching the vendor trace byte for byte. The returned value itself (the
+// device's actual frame clock) is M5's pacing input.
+static NTSTATUS
+EmuIsochArmFeedback(
+    _Inout_ PEMU_ISOCH_STREAM S
+    )
+{
+    struct _URB_ISOCH_TRANSFER* u = &S->FbUrb->UrbIsochronousTransfer;
+
+    u->Hdr.Function = URB_FUNCTION_ISOCH_TRANSFER;
+    u->Hdr.Length = (USHORT)sizeof(struct _URB_ISOCH_TRANSFER);
+    u->Hdr.Status = 0;
+    u->PipeHandle = S->FeedbackPipe;
+    u->TransferFlags = USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK;
+    u->TransferBuffer = S->FbBuffer;
+    u->TransferBufferLength = 4;
+    // "Now", never zero: StartFrame 0 sits forty-nine days in the counter's
+    // past and the xHCI scheduling arithmetic bugchecks on it (2.0.0.61).
+    u->StartFrame = (ULONG)(S->PaceBaseFrame +
+        (KeQueryInterruptTime() - S->PaceOrigin) / 10000);
+    u->NumberOfPackets = 1;
+    u->IsoPacket[0].Offset = 0;
+    u->IsoPacket[0].Length = 4;
+    u->IsoPacket[0].Status = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+EmuIsochSubmitFeedback(
+    _Inout_ PEMU_ISOCH_STREAM   S,
+    _In_ PEMU_DEVICE_CONTEXT    Ctx
+    )
+{
+    // The feedback packet is submitted synchronously from the feedback
+    // thread (EmuIsochFeedbackWorker): EmuUsbSubmitUrb allocates its own IRP
+    // and waits, so no completion routine, no reuse race - the asynchronous
+    // reader of 2.0.0.61/62 crashed inside the controller's completion APC
+    // machinery.
+    return EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, S->FbUrb);
+}
+
+// The feedback thread: submit one 4-byte iso IN packet, wait for the device
+// to fill it, repeat. The device's own feedback interval paces the loop
+// (~30 packets per second on the 0404); StopStream aborts the feedback
+// pipe, which completes the pending packet and lets the loop see Quit.
+static VOID
+EmuIsochFeedbackWorker(
+    _In_ PVOID StartContext
+    )
+{
+    PEMU_ISOCH_STREAM   S = (PEMU_ISOCH_STREAM)StartContext;
+    PEMU_DEVICE_CONTEXT Ctx = (PEMU_DEVICE_CONTEXT)S->Owner;
+
+    while (S->FbUrb != NULL &&
+           InterlockedCompareExchange(&S->Quit, 0, 0) == 0) {
+        if (!NT_SUCCESS(EmuIsochArmFeedback(S))) {
+            break;
+        }
+        if (!NT_SUCCESS(EmuIsochSubmitFeedback(S, Ctx))) {
+            break;
+        }
+    }
 }
 
 // Read one completion into the counters. A render frame becomes visible to
@@ -291,6 +397,10 @@ EmuIsochWorker(
                           (ULONG)i, status);
         }
     }
+    // The feedback reader lives on its own thread (EmuIsochFeedbackWorker):
+    // a synchronous reader here would block the data pipeline, and the
+    // asynchronous shared-IRP reader of 2.0.0.61/62 crashed in the
+    // controller's completion machinery.
 
     while (InterlockedCompareExchange(&S->Quit, 0, 0) == 0) {
         BOOLEAN anySubmitted = FALSE;
@@ -412,6 +522,16 @@ EmuIsochFreeStream(
         ExFreePoolWithTag(S->Buffer, EMU_POOLTAG);
         S->Buffer = NULL;
     }
+    // The feedback reader resources: the threads have been waited on, so
+    // nothing is in flight here anymore.
+    if (S->FbUrb != NULL) {
+        USBD_UrbFree(Ctx->UsbdHandle, S->FbUrb);
+        S->FbUrb = NULL;
+    }
+    if (S->FbBuffer != NULL) {
+        ExFreePoolWithTag(S->FbBuffer, EMU_POOLTAG);
+        S->FbBuffer = NULL;
+    }
     S->Active = FALSE;
     S->Quit = 0;
     S->Pipe = NULL;
@@ -467,6 +587,21 @@ EmuIsochStopStream(
                          Direction, status);
         }
     }
+    if (S->FeedbackPipe != NULL) {
+        // Abort the feedback pipe BEFORE waiting on the threads: the
+        // feedback thread is parked inside a synchronous EmuUsbSubmitUrb on
+        // that pipe, and the abort is what completes it.
+        status = USBD_UrbAllocate(Ctx->UsbdHandle, &abortUrb);
+        if (NT_SUCCESS(status)) {
+            abortUrb->UrbPipeRequest.Hdr.Function = URB_FUNCTION_ABORT_PIPE;
+            abortUrb->UrbPipeRequest.Hdr.Length =
+                (USHORT)sizeof(struct _URB_PIPE_REQUEST);
+            abortUrb->UrbPipeRequest.Hdr.Status = 0;
+            abortUrb->UrbPipeRequest.PipeHandle = S->FeedbackPipe;
+            (VOID)EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, abortUrb);
+            USBD_UrbFree(Ctx->UsbdHandle, abortUrb);
+        }
+    }
 
     if (S->ThreadObject != NULL) {
         KeWaitForSingleObject(S->ThreadObject, Executive, KernelMode, FALSE,
@@ -476,6 +611,17 @@ EmuIsochStopStream(
     } else if (S->ThreadHandle != NULL) {
         KeWaitForSingleObject(S->ThreadHandle, Executive, KernelMode, FALSE,
                               NULL);
+    }
+    if (S->FbThreadObject != NULL) {
+        KeWaitForSingleObject(S->FbThreadObject, Executive, KernelMode, FALSE,
+                              NULL);
+        ObDereferenceObject(S->FbThreadObject);
+        S->FbThreadObject = NULL;
+    } else if (S->FbThreadHandle != NULL) {
+        KeWaitForSingleObject(S->FbThreadHandle, Executive, KernelMode, FALSE,
+                              NULL);
+        ZwClose(S->FbThreadHandle);
+        S->FbThreadHandle = NULL;
     }
     EmuIsochFreeStream(Ctx, Direction);
 }
@@ -559,6 +705,36 @@ EmuIsochStartStream(
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
+    // Pipe-visibility breadcrumb: full per-pipe facts as separate values.
+    // PipeInfoK: (endpoint << 24) | (type << 16) | (mps << 0), and PipeUsK:
+    // the raw Interval. The feedback endpoint (usage=feedback, 0x11 in
+    // bmAttributes, wMaxPacketSize 4) must be among them or the reader has
+    // nothing to read. The 2.0.0.60 nibble packing was ambiguous; the first
+    // pipe's nibble read as 9 - an endpoint the descriptor does not have.
+    {
+        ULONG npipes = iface->NumberOfPipes;
+
+        if (npipes > 8) {
+            npipes = 8;
+        }
+        for (ULONG p = 0; p < npipes; p++) {
+            PUSBD_PIPE_INFORMATION pipe = &iface->Pipes[p];
+            WCHAR name[32];
+
+            RtlStringCbPrintfW(name, sizeof(name),
+                               Direction == EMU_STREAM_RENDER
+                                   ? L"PipeInfoR%lu" : L"PipeInfoC%lu", p);
+            EmuNoteStatusValue(Ctx, name,
+                               ((ULONG)pipe->EndpointAddress << 24) |
+                               ((ULONG)pipe->PipeType << 16) |
+                               (pipe->MaximumPacketSize & 0xFFFF));
+            RtlStringCbPrintfW(name, sizeof(name),
+                               Direction == EMU_STREAM_RENDER
+                                   ? L"PipeUsR%lu" : L"PipeUsC%lu", p);
+            EmuNoteStatusValue(Ctx, name, pipe->Interval);
+        }
+    }
+
     // The data pipe is the one that matches the direction; on the render
     // interface the IN isochronous pipe next to the OUT is the feedback
     // endpoint, parked here for M5 rather than streamed.
@@ -569,9 +745,11 @@ EmuIsochStartStream(
         if (pipe->PipeType != UsbdPipeTypeIsochronous) {
             continue;
         }
-        if (isIn == out) {
-            continue;
-        }
+        // Direction decides, no skipping: on the render interface the IN
+        // isochronous pipe next to the OUT is the feedback endpoint, and the
+        // old `isIn == out` skip rejected every IN pipe before the feedback
+        // branch could ever take it - TestFb0 was 0 since M3-B (2.0.0.60
+        // breadcrumb PipesR proved the pipe was there all along).
         if (isIn == (Direction == EMU_STREAM_CAPTURE)) {
             if (dataPipe == NULL) {
                 dataPipe = pipe;
@@ -619,12 +797,24 @@ EmuIsochStartStream(
         EmuIsochFreeStream(Ctx, Direction);
         return STATUS_INVALID_PARAMETER;
     }
-    if (!EmuIsochNominalFramesExact(RateHz, S->PeriodMs, &S->NominalFrames)) {
-        EMU_LOG_ERROR(STR_MODULENAME "dir %lu: %lu Hz on a %lu ms grid has no "
-                      "exact packet size\n", Direction, RateHz, S->PeriodMs);
-        EmuIsochFreeStream(Ctx, Direction);
-        return STATUS_INVALID_PARAMETER;
+    // The wire grid follows the device's own bInterval: the 0404's streaming
+    // alternates carry bInterval 4 (high-speed microframes) = one iso
+    // transaction every 500 us, and the feedback endpoint reports 24 frames
+    // per that window (16.16 value 0x00180000 in the vendor trace). The CA0189
+    // hardware iso mechanism consumes FIFO on that schedule - 48-frame packets
+    // once per millisecond starve it (every earlier build, silent). The
+    // feedback thread services the endpoint continuously (2.0.0.65 sync
+    // reader, safe).
+    S->PeriodUs = S->PipeInterval * 125;
+    if (S->PeriodUs == 0 || S->PeriodUs > 1000) {
+        S->PeriodUs = 500;
     }
+    S->FramesPerPacket = RateHz * S->PeriodUs / 1000000;
+    if (S->FramesPerPacket == 0) {
+        S->FramesPerPacket = 1;
+    }
+    S->NominalFrames = S->FramesPerPacket;
+    S->PeriodMs = 1;   // legacy breadcrumb field
     S->BytesPerFrame = Alt->Channels * Alt->SubFrameSize;
     S->SlotBytes = EmuIsochSlotBytes(S->NominalFrames, S->BytesPerFrame,
                                      S->MaxPacketSize);
@@ -647,6 +837,10 @@ EmuIsochStartStream(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     if (out && S->FillRender == NULL) {
+        // Probe instrumentation: the wire is about to get the deterministic
+        // ramp instead of client data - inaudible near-DC, perfect counters,
+        // total silence. This value in the registry identifies that state.
+        EmuNoteStatusValue(Ctx, L"PatternFill", 1);
         EmuIsochFillOutPattern(S);
     } else {
         // WaveRT slots are filled afresh by the prime pass; capture and any
@@ -684,6 +878,32 @@ EmuIsochStartStream(
         frameUrb->UrbGetCurrentFrameNumber.Hdr.Status = 0;
         status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, frameUrb);
     }
+    if (NT_SUCCESS(status)) {
+        // Calibrate the counter units: query twice across 10 ms of interrupt
+        // time. Millisecond frames give delta 10; a microframe-based counter
+        // gives 80. The pacing below scales with it - wrong units schedule
+        // every packet in the past, the controller completes them all at
+        // once, and the wire runs many times faster than real audio.
+        ULONG f1 = frameUrb->UrbGetCurrentFrameNumber.FrameNumber;
+        LARGE_INTEGER calDelay;
+
+        calDelay.QuadPart = -10 * 10000LL;   // 10 ms
+        KeDelayExecutionThread(KernelMode, FALSE, &calDelay);
+        frameUrb->UrbGetCurrentFrameNumber.Hdr.Status = 0;
+        status = EmuUsbSubmitUrb(Ctx->Pdo, Ctx->UsbdHandle, frameUrb);
+        if (NT_SUCCESS(status)) {
+            ULONG f2 = frameUrb->UrbGetCurrentFrameNumber.FrameNumber;
+            ULONG delta = f2 > f1 ? f2 - f1 : 1;
+
+            S->FramesPerMs = delta / 10;
+            if (S->FramesPerMs == 0) {
+                S->FramesPerMs = 1;
+            }
+            EmuNoteStatusValue(Ctx, Direction == EMU_STREAM_RENDER
+                                    ? L"CalFramesPerMs" : L"CalFramesPerMsC",
+                               S->FramesPerMs);
+        }
+    }
     if (!NT_SUCCESS(status)) {
         EMU_LOG_ERROR(STR_MODULENAME "current frame query failed, 0x%x\n",
                       status);
@@ -695,6 +915,8 @@ EmuIsochStartStream(
     }
     base = frameUrb->UrbGetCurrentFrameNumber.FrameNumber +
            EMU_ISOCH_FRAME_MARGIN;
+    S->PaceOrigin = KeQueryInterruptTime();
+    S->PaceBaseFrame = frameUrb->UrbGetCurrentFrameNumber.FrameNumber;
     USBD_UrbFree(Ctx->UsbdHandle, frameUrb);
     for (ULONG i = 0; i < EMU_ISOCH_SLOTS; i++) {
         S->Slots[i].NextFrame = base + i * S->PeriodMs;
@@ -702,6 +924,28 @@ EmuIsochStartStream(
     // The wire verdict: the first StartFrame, for correlating a bus trace.
     EmuNoteStatusValue(Ctx, Direction == EMU_STREAM_RENDER
                             ? L"TestFrame0" : L"TestFrame1", base);
+
+    // The feedback reader, allocated before the worker starts: without an
+    // actively serviced feedback endpoint the asynchronous OUT sink never
+    // locks its DAC (the 2.0.0.23 - 2.0.0.58 silence). The reader runs on
+    // its own thread with a synchronous one-packet-at-a-time submit through
+    // EmuUsbSubmitUrb - the shared-IRP asynchronous variant of 2.0.0.61/62
+    // crashed inside the controller's completion APC machinery.
+
+    if (S->FeedbackPipe != NULL) {
+        S->FbBuffer = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, 8,
+                                              EMU_POOLTAG);
+        if (S->FbBuffer == NULL) {
+            EmuIsochFreeStream(Ctx, Direction);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(S->FbBuffer, 8);
+        status = USBD_IsochUrbAllocate(Ctx->UsbdHandle, 1, &S->FbUrb);
+        if (!NT_SUCCESS(status)) {
+            EmuIsochFreeStream(Ctx, Direction);
+            return status;
+        }
+    }
 
     S->Active = TRUE;
     InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
@@ -726,6 +970,30 @@ EmuIsochStartStream(
     }
     S->ThreadHandle = NULL;
     ZwClose(threadHandle);
+
+    // The feedback thread: started last, aborted first (StopStream aborts
+    // both pipes before waiting on the threads).
+    S->FbThreadHandle = NULL;
+    S->FbThreadObject = NULL;
+    if (S->FbUrb != NULL) {
+        status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, &oa,
+                                      NULL, NULL, EmuIsochFeedbackWorker, S);
+        if (!NT_SUCCESS(status)) {
+            S->FbThreadHandle = NULL;
+            EmuIsochStopStream(Ctx, Direction);
+            return status;
+        }
+        S->FbThreadHandle = threadHandle;
+        if (NT_SUCCESS(ObReferenceObjectByHandle(threadHandle,
+                                                 THREAD_ALL_ACCESS,
+                                                 *PsThreadType, KernelMode,
+                                                 &S->FbThreadObject, NULL))) {
+            ZwClose(threadHandle);
+            S->FbThreadHandle = NULL;
+        } else {
+            S->FbThreadObject = NULL;
+        }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -775,8 +1043,59 @@ EmuIsochStartRender(
         return status;
     }
 
+    // Unconditional mute-off on the master feature unit. The device keeps
+    // mute in its nonvolatile state and has no USB volume (the front-panel
+    // knob is the only gain): a device that last met the stock panel muted
+    // streams perfectly and stays silent - the no-sound report of the first
+    // 2.0.0.40 hardware run. Not fatal when it fails: the stream is
+    // independent of it, and the breadcrumb records the wire verdict.
+    if (Ctx->Caps->FeatureUnitCount > 0) {
+        EMU_CTRL_REQUEST muteRequest;
+
+        status = EmuCtrlBuildMuteOff(&muteRequest,
+                                     Ctx->Caps->FeatureUnits[0].UnitID,
+                                     Ctx->Caps->FeatureUnits[0].InterfaceNumber);
+        if (NT_SUCCESS(status)) {
+            status = EmuUsbSendControl(Ctx, &muteRequest, muteRequest.Payload);
+        }
+        EmuNoteStatusValue(Ctx, L"MuteSetStatus", (ULONG)status);
+
+        // Per-channel volume = 0 dB, ALL volume-capable channels. The device
+        // keeps these in its nonvolatile memory; a unit last seen by the
+        // stock panel at -inf is silent through any stream despite the
+        // unmute above. The 0404 feature unit covers four output channels
+        // (main L/R + headphone L/R) and the two-channel stream may map to
+        // any pair of them - set every one. Master (channel 0) has no volume
+        // control and is skipped. Status bytes: low byte = channel 1, then
+        // 2, 3, 4. Not fatal: the stream is independent of it.
+        if (Ctx->Caps->FeatureUnits[0].ChannelCount >= 1) {
+            EMU_CTRL_REQUEST volRequest;
+            ULONG volStatus = 0;
+            ULONG channels = Ctx->Caps->FeatureUnits[0].ChannelCount;
+
+            if (channels > 4) {
+                channels = 4;
+            }
+            for (LONG ch = (LONG)channels; ch >= 1; ch--) {
+                status = EmuCtrlBuildVolumeSet(&volRequest,
+                                               Ctx->Caps->FeatureUnits[0].UnitID,
+                                               Ctx->Caps->FeatureUnits[0].InterfaceNumber,
+                                               (ULONG)ch, 0);
+                if (NT_SUCCESS(status)) {
+                    status = EmuUsbSendControl(Ctx, &volRequest,
+                                               volRequest.Payload);
+                }
+                volStatus = (volStatus << 8) | (UCHAR)(status & 0xFF);
+            }
+            EmuNoteStatusValue(Ctx, L"VolSetStatus", volStatus);
+        }
+    }
+
     S->CallbackContext = CallbackContext;
     S->FillRender = FillRender;
+    // Probe instrumentation: the assignment happened - the absence of this
+    // value with a successful start means the run never reached this line.
+    EmuNoteStatusValue(Ctx, L"FillSet", 0x10000001);
     S->RenderCompleted = RenderCompleted;
     S->BaseFrames = BaseFrames;
     status = EmuIsochStartStream(Ctx, EMU_STREAM_RENDER, alt, RateHz);

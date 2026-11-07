@@ -235,3 +235,35 @@ EmuCtrlBuildSpdifFormatSet(
     return EmuCtrlBuildByteSet(Request, UnitId, AcInterface,
                                EMU_XU_CS_DIGITAL_FORMAT, Format, 2);
 }
+
+NTSTATUS
+EmuCtrlBuildMuteOff(
+    _Out_ PEMU_CTRL_REQUEST Request,
+    _In_ ULONG FeatureUnitId,
+    _In_ ULONG AcInterface
+    )
+{
+    return EmuCtrlBuildByteSet(Request, FeatureUnitId, AcInterface,
+                               EMU_FEATURE_CS_MUTE, 0, 1);
+}
+
+NTSTATUS
+EmuCtrlBuildVolumeSet(
+    _Out_ PEMU_CTRL_REQUEST Request,
+    _In_ ULONG FeatureUnitId,
+    _In_ ULONG AcInterface,
+    _In_ ULONG Channel,
+    _In_ SHORT Volume
+    )
+{
+    NTSTATUS status;
+
+    status = EmuCtrlBuildInto(Request, EMU_CTRL_REQUEST_TYPE_OUT, FeatureUnitId,
+                              AcInterface, EMU_FEATURE_CS_VOLUME, Channel, 2);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    Request->Payload[0] = (UCHAR)(Volume & 0xFF);
+    Request->Payload[1] = (UCHAR)((Volume >> 8) & 0xFF);
+    return STATUS_SUCCESS;
+}
