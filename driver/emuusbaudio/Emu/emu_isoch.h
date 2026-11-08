@@ -124,6 +124,13 @@ typedef struct _EMU_DEVICE_CONTEXT EMU_DEVICE_CONTEXT, *PEMU_DEVICE_CONTEXT;
 #define EMU_ISOCH_SLOT_FREE          0
 #define EMU_ISOCH_SLOT_ARMED         1
 
+// The planned shape of one isochronous packet descriptor: where the packet
+// sits in the transfer buffer and how many bytes were programmed for it.
+typedef struct _EMU_ISOCH_PACKET_PLAN {
+    ULONG Offset;
+    ULONG Length;
+} EMU_ISOCH_PACKET_PLAN, *PEMU_ISOCH_PACKET_PLAN;
+
 // The engine's owns-one-direction state. Lives inside EMU_DEVICE_CONTEXT, so
 // everything here is zeroed by IoCreateDevice and dies with the instance.
 #ifdef EMU_KERNEL
@@ -135,6 +142,11 @@ typedef struct _EMU_ISOCH_SLOT {
     PURB    Urb;            // USBD_IsochUrbAllocate, two packets
     PEMU_ISOCH_STREAM Stream; // back-pointer for the completion routine
     volatile LONG State;    // EMU_ISOCH_SLOT_FREE / EMU_ISOCH_SLOT_ARMED
+    // What the last build programmed into this slot's descriptors, kept beside
+    // the URB so the completion can record planned vs actual in the diag ring
+    // (the URB's own IsoPacket[].Length is overwritten with the actual bytes
+    // for an IN transfer, so the planned value lives nowhere else).
+    EMU_ISOCH_PACKET_PLAN Plan[EMU_ISOCH_PKTS_PER_URB];
 } EMU_ISOCH_SLOT, *PEMU_ISOCH_SLOT;
 
 typedef struct _EMU_ISOCH_FB_SLOT {
@@ -269,6 +281,14 @@ struct _EMU_ISOCH_STREAM {
     volatile LONG    Bytes;
     volatile LONG    LastUrbStatus;
     volatile LONG    LastPacketStatus;
+    // P1 diagnostics: the recent per-URB wire history (planned vs actual per
+    // packet, statuses, StartFrame). Fixed-size ring inside the device
+    // extension - no allocation, no failure path; the diag IOCTL copies it
+    // out. Written by the completion routines (one row per completed data
+    // URB, seq = interlocked ticket, so two CPUs never write one row), reset
+    // at start, survives the stop for post-run inspection.
+    EMU_ISOCH_DIAG_ROW Diag[EMU_ISOCH_DIAG_ROWS];
+    volatile LONG    DiagSeq;         // completions recorded since start
 };
 
 #endif // EMU_KERNEL
@@ -351,6 +371,77 @@ EmuIsochPickAltIndex(
     _In_ ULONG RateHz
     );
 
+// The fixed-nominal packet layout of one URB, exactly as EmuIsochBuildSlot
+// programs it for a capture stream and for a render stream with no fill
+// callback (the probe path): two packets, each covering half the audio of one
+// bus frame. Everything is computed with overflow-checked arithmetic; FALSE
+// means "these numbers cannot describe a layout", not a partial plan.
+//
+// The render case (Out) describes payloads: every packet carries its half of
+// the nominal frames. The capture case (IN) describes capacities: the slot
+// buffer is EmuIsochSlotBytes (nominal plus headroom, at least the pipe's
+// maximum) and each packet is allowed up to half of it. The two disagree on
+// the packet stride when the headroom is nonzero - which is the P1 suspicion
+// recorded in docs/v3_plan.md and pinned by the isoch unit test; the layout
+// stays as-is until the hardware verdict, and EmuIsochValidateLayout is the
+// instrument that states the disagreement precisely.
+BOOLEAN
+EmuIsochPlanFixedNominal(
+    _In_ ULONG NominalFrames,
+    _In_ ULONG BytesPerFrame,
+    _In_ ULONG MaxPacketSize,
+    _In_ BOOLEAN Out,
+    _Out_ PULONG TransferBufferLength,
+    _Out_writes_(EMU_ISOCH_PKTS_PER_URB) PEMU_ISOCH_PACKET_PLAN Plan
+    );
+
+// The contract a two-packet isochronous layout must satisfy for the Windows
+// USB stack to schedule it: packets inside the transfer buffer, inside the
+// endpoint's packet size, monotonically placed and not overlapping. This is
+// the driver's restatement of the USBD_ISO_PACKET_DESCRIPTOR rules (P1.2) -
+// an executable specification the unit test pins, not a run-time gate: the
+// builder does not consult it yet, so the P1 wire behavior stays frozen while
+// the diagnostics run. Violations are reported per packet: FirstBad is the
+// 0-based index of the first packet that breaks a rule, or PacketCount when
+// the layout is clean.
+BOOLEAN
+EmuIsochValidateLayout(
+    _In_ ULONG TransferBufferLength,
+    _In_ ULONG MaxPacketSize,
+    _In_reads_(PacketCount) const EMU_ISOCH_PACKET_PLAN* Plan,
+    _In_ ULONG PacketCount,
+    _Out_ PULONG FirstBad
+    );
+
+// The arithmetic of one data-URB completion, separated from the kernel
+// counters so the unit test can run every completion shape the wire can
+// produce (full, short, empty, failed, canceled, mixed packets) against the
+// same code the completion routine calls. The kernel side applies the result
+// to the interlocked counters and the fail-stop rules; this function only
+// reads.
+typedef struct _EMU_ISOCH_COMPLETION_SUMMARY {
+    ULONG  TotalBytes;      // sum of the per-packet transferred bytes
+    ULONG  ExpectedBytes;   // the nominal payload of the whole URB
+    BOOLEAN Short;          // TotalBytes below ExpectedBytes
+    ULONG  PacketErrors;    // packets whose USBD status is not a success
+    ULONG  LastPacketStatus;// the status of the last failing packet, else 0
+    BOOLEAN UrbFailed;      // IRP or URB header status says failure
+    NTSTATUS FailStatus;    // the failing status (IRP wins when both failed)
+    ULONG  FramesTransferred; // TotalBytes / BytesPerFrame (0 when it divides
+                              // nothing - guarded against a zero stride)
+} EMU_ISOCH_COMPLETION_SUMMARY, *PEMU_ISOCH_COMPLETION_SUMMARY;
+
+VOID
+EmuIsochEvaluateCompletion(
+    _In_ ULONG NominalFrames,
+    _In_ ULONG BytesPerFrame,
+    _In_ NTSTATUS IrpStatus,
+    _In_ NTSTATUS UrbStatus,
+    _In_reads_(EMU_ISOCH_PKTS_PER_URB) const ULONG* PacketLength,
+    _In_reads_(EMU_ISOCH_PKTS_PER_URB) const ULONG* PacketStatus,
+    _Out_ PEMU_ISOCH_COMPLETION_SUMMARY Summary
+    );
+
 #ifdef EMU_KERNEL
 
 // --- engine (kernel only) ----------------------------------------------------
@@ -426,6 +517,15 @@ VOID
 EmuIsochFillStats(
     _Out_ PEMU_TEST_STREAM_STATS Out,
     _In_ PEMU_DEVICE_CONTEXT     Ctx
+    );
+
+// Fill the P1 diagnostics reply from both engines: the recent per-URB wire
+// history (planned vs actual packet bytes, statuses, StartFrame). No lock is
+// held or needed - see the ring's contract in emu_ioctl.h.
+VOID
+EmuIsochFillDiag(
+    _Out_ PEMU_ISOCH_DIAG_INFO Out,
+    _In_ PEMU_DEVICE_CONTEXT   Ctx
     );
 
 #endif // EMU_KERNEL

@@ -155,6 +155,8 @@ cd driver
 
 - `emu-probe.exe` — capabilities, состояние, счётчики start/stop;
 - `stats_dump.exe` — счётчики ISO-движка по направлениям (submits/completes/errors);
+- `iso-diag.exe` — по-URB история провода (план/факт по каждому пакету,
+  статусы IRP/URB/пакета; P1-разбор capture, см. `docs/ISOCH_PUMP.md` §12);
 - `pump_probe.exe` — самозавершающаяся стрим-проба (render+capture, 8×500 мс срезов);
 - breadcrumbs — именованные значения в
   `HKLM\SYSTEM\CurrentControlSet\Services\EmuUSBAudio\Parameters` (пишутся драйвером:

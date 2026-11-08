@@ -196,6 +196,230 @@ static void CasePickAlt(void)
     CHECK_EQ(EmuIsochPickAltIndex(alts, 2, EMU_STREAM_RENDER, 1, 48000), 2);
 }
 
+static void CasePlanFixedNominal(void)
+{
+    EMU_ISOCH_PACKET_PLAN plan[2];
+    ULONG ttl = 0;
+
+    g_case = "plan-fixed-nominal";
+    // The render probe path: payloads, exactly half the URB's audio per
+    // packet, contiguous on the wire. 48 kHz stereo: 48 frames * 6 bytes,
+    // two 144-byte packets in a 288-byte buffer.
+    CHECK(EmuIsochPlanFixedNominal(48, 6, 298, TRUE, &ttl, plan));
+    CHECK_EQ(ttl, 288);
+    CHECK_EQ(plan[0].Offset, 0);
+    CHECK_EQ(plan[0].Length, 144);
+    CHECK_EQ(plan[1].Offset, 144);
+    CHECK_EQ(plan[1].Length, 144);
+    {
+        ULONG bad = 99;
+        CHECK(EmuIsochValidateLayout(288, 298, plan, 2, &bad));
+        CHECK_EQ(bad, 2);
+    }
+    // An odd frame count splits floor-wise: 49 frames * 6 = 294, halves 147,
+    // strides 147 - still contiguous, still whole packets.
+    CHECK(EmuIsochPlanFixedNominal(49, 6, 298, TRUE, &ttl, plan));
+    CHECK_EQ(ttl, 294);
+    CHECK_EQ(plan[0].Offset, 0);
+    CHECK_EQ(plan[0].Length, 147);
+    CHECK_EQ(plan[1].Offset, 147);
+    CHECK_EQ(plan[1].Length, 147);
+
+    // The capture path: capacities out of EmuIsochSlotBytes (nominal plus two
+    // headroom frames, at least the pipe maximum) but the descriptor STRIDE
+    // still comes from the nominal audio. On the 0404's 48 kHz IN alt
+    // (MPS 154) the slot is 300 bytes, so each packet claims 150 while the
+    // second one starts at 144: a 6-byte overlap. This is the P1 layout
+    // suspicion (docs/v3_plan.md, ISOCH_PUMP.md) pinned as a fact of the
+    // current builder until the hardware verdict; when the layout is fixed
+    // these three lines change with it.
+    CHECK(EmuIsochPlanFixedNominal(48, 6, 154, FALSE, &ttl, plan));
+    CHECK_EQ(ttl, 300);
+    CHECK_EQ(plan[0].Offset, 0);
+    CHECK_EQ(plan[0].Length, 150);
+    CHECK_EQ(plan[1].Offset, 144);
+    CHECK_EQ(plan[1].Length, 150);
+    {
+        ULONG bad = 99;
+
+        CHECK(!EmuIsochValidateLayout(300, 154, plan, 2, &bad));
+        CHECK_EQ(bad, 1);
+    }
+    // The same divergence with an oversized pipe: capacities grow with the
+    // slot, the stride does not - the overlap is structural, not an accident
+    // of one MPS.
+    CHECK(EmuIsochPlanFixedNominal(48, 6, 4096, FALSE, &ttl, plan));
+    CHECK_EQ(ttl, 4096);
+    CHECK_EQ(plan[0].Length, 2048);
+    CHECK_EQ(plan[1].Offset, 144);
+    {
+        ULONG bad = 99;
+
+        CHECK(!EmuIsochValidateLayout(4096, 4096, plan, 2, &bad));
+        CHECK_EQ(bad, 1);
+    }
+
+    // Impossible shapes are refusals, not wrapped plans.
+    CHECK(!EmuIsochPlanFixedNominal(1, 6, 154, FALSE, &ttl, plan));
+    CHECK(!EmuIsochPlanFixedNominal(8192, 6, 154, FALSE, &ttl, plan));
+    CHECK(!EmuIsochPlanFixedNominal(48, 0, 154, FALSE, &ttl, plan));
+    CHECK(!EmuIsochPlanFixedNominal(48, 65, 154, FALSE, &ttl, plan));
+    CHECK(!EmuIsochPlanFixedNominal(48, 6, 0, FALSE, &ttl, plan));
+    CHECK(!EmuIsochPlanFixedNominal(48, 6, 65537, FALSE, &ttl, plan));
+    CHECK(!EmuIsochPlanFixedNominal(48, 6, 154, FALSE, NULL, plan));
+    CHECK(!EmuIsochPlanFixedNominal(48, 6, 154, FALSE, &ttl, NULL));
+}
+
+static void CaseValidateLayout(void)
+{
+    EMU_ISOCH_PACKET_PLAN plan[3];
+    ULONG bad = 99;
+
+    g_case = "validate-layout";
+    // Clean contiguous pair.
+    plan[0].Offset = 0;   plan[0].Length = 144;
+    plan[1].Offset = 144; plan[1].Length = 144;
+    CHECK(EmuIsochValidateLayout(288, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 2);
+    // A gap between packets is fine: the OS hands the ring over in whole
+    // packets, but nothing in the contract requires them back to back.
+    plan[1].Offset = 256;
+    CHECK(EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 2);
+    // Overlap: the second packet starts before the first ends - the P1
+    // suspect class. The failing packet is named.
+    plan[1].Offset = 100;
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 1);
+    // Beyond the transfer buffer: the stack would DMA past the allocation.
+    plan[1].Offset = 392;
+    plan[1].Length = 16;
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 1);
+    // Packet larger than the endpoint's maximum: not wire-legal, whatever the
+    // buffer holds.
+    plan[1].Offset = 144;
+    plan[1].Length = 155;
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 1);
+    // Zero-length tail packets are legal, exactly at the previous end.
+    plan[1].Length = 0;
+    CHECK(EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 2);
+    // ...but a zero-length packet placed behind the previous end is a
+    // placement error all the same.
+    plan[1].Offset = 100;
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 1);
+    // The offset arithmetic must not wrap: 0xFFFFFFFF + 1 exceeds any buffer
+    // without a 32-bit overflow saying otherwise.
+    plan[0].Offset = 0xFFFFFFFF;
+    plan[0].Length = 1;
+    plan[1].Offset = 0;
+    plan[1].Length = 0;
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK_EQ(bad, 0);
+    // An empty or absent plan is not a layout.
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 0, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, NULL, 2, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, NULL));
+}
+
+static void CaseEvaluateCompletion(void)
+{
+    EMU_ISOCH_COMPLETION_SUMMARY sum;
+    ULONG lengths[2];
+    ULONG statuses[2];
+
+    g_case = "evaluate-completion";
+    // Full, clean URB: both packets, everything succeeded.
+    lengths[0] = 144; lengths[1] = 144;
+    statuses[0] = 0;  statuses[1] = 0;
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK_EQ(sum.TotalBytes, 288);
+    CHECK_EQ(sum.ExpectedBytes, 288);
+    CHECK(!sum.Short);
+    CHECK_EQ(sum.PacketErrors, 0);
+    CHECK(!sum.UrbFailed);
+    CHECK_EQ(sum.FramesTransferred, 48);
+
+    // The 2.0.0.70 wire shape: only the first packet's bytes arrive.
+    // 144 + 4 = 148 - the observed per-URB total - and 24 whole frames of it.
+    lengths[0] = 144; lengths[1] = 4;
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK_EQ(sum.TotalBytes, 148);
+    CHECK(sum.Short);
+    CHECK_EQ(sum.PacketErrors, 0);
+    CHECK_EQ(sum.FramesTransferred, 24);
+
+    // The device sent nothing: zero bytes is short, not broken.
+    lengths[0] = 0; lengths[1] = 0;
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK_EQ(sum.TotalBytes, 0);
+    CHECK(sum.Short);
+    CHECK_EQ(sum.FramesTransferred, 0);
+    CHECK(!sum.UrbFailed);
+
+    // A failing packet: its status is counted and remembered, its bytes (if
+    // any) still count - the schedule consumed the slot either way.
+    lengths[0] = 144; lengths[1] = 0;
+    statuses[0] = 0;  statuses[1] = 0xC0000002u;   // a USBD_STATUS error
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK_EQ(sum.PacketErrors, 1);
+    CHECK_EQ(sum.LastPacketStatus, 0xC0000002u);
+    CHECK_EQ(sum.TotalBytes, 144);
+    CHECK(!sum.UrbFailed);
+    statuses[1] = 0;
+
+    // USBD_STATUS semantics: signed, negative means error. A positive
+    // non-zero status is a success by the same rule the kernel macro uses -
+    // pinned here so nobody "fixes" one side of it alone.
+    statuses[0] = 1;  statuses[1] = 0x7FFFFFFFu;
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK_EQ(sum.PacketErrors, 0);
+    statuses[0] = 0x80000000u;  statuses[1] = 0xFFFFFFFFu;
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK_EQ(sum.PacketErrors, 2);
+    CHECK_EQ(sum.LastPacketStatus, 0xFFFFFFFFu);
+    statuses[0] = 0; statuses[1] = 0;
+
+    // IRP-level cancellation: the URB verdict follows the IRP, and the bytes
+    // the stack managed to report still count.
+    lengths[0] = 144; lengths[1] = 144;
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0xC0000120u, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK(sum.UrbFailed);
+    CHECK_EQ((ULONG)sum.FailStatus, 0xC0000120u);
+    CHECK_EQ(sum.TotalBytes, 288);
+
+    // URB-level failure with a clean IRP: the URB status is the verdict.
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0, (NTSTATUS)0xC0010000u,
+                               lengths, statuses, &sum);
+    CHECK(sum.UrbFailed);
+    CHECK_EQ((ULONG)sum.FailStatus, 0xC0010000u);
+
+    // Both failed: the IRP wins, matching the harvest's LastUrbStatus rule.
+    EmuIsochEvaluateCompletion(48, 6, (NTSTATUS)0xC0000120u,
+                               (NTSTATUS)0xC0010000u,
+                               lengths, statuses, &sum);
+    CHECK_EQ((ULONG)sum.FailStatus, 0xC0000120u);
+
+    // Degenerate stride: zero bytes per frame cannot divide, the frame count
+    // reports 0 instead of trapping.
+    EmuIsochEvaluateCompletion(48, 0, (NTSTATUS)0, (NTSTATUS)0,
+                               lengths, statuses, &sum);
+    CHECK_EQ(sum.FramesTransferred, 0);
+    CHECK_EQ(sum.ExpectedBytes, 0);
+    CHECK(!sum.Short);   // 0 == 0 is not short
+}
+
+
 int main(void)
 {
     CasePeriod();
@@ -204,6 +428,9 @@ int main(void)
     CaseCursorAnchor();
     CaseFramesPerMs();
     CasePickAlt();
+    CasePlanFixedNominal();
+    CaseValidateLayout();
+    CaseEvaluateCompletion();
     printf("%d checks, %d failures\n", g_checks, g_failures);
     printf("RESULT: %s\n", g_failures == 0 ? "PASS" : "FAIL");
     return g_failures == 0 ? 0 : 1;

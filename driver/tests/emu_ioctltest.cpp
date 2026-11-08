@@ -254,9 +254,26 @@ static void CaseTestStreamRules(void)
     CHECK_EQ(d.Action, EmuIoctlReject);
     CheckStatus("test-stats-not-ready", STATUS_DEVICE_NOT_READY, d.Status);
 
-    // The neighbouring function code stays foreign: 0x809 forward, the way
+    // The P1 diagnostics reply: same read-only shape as the stats query.
+    Decide(&d, EMU_IOCTL_TEST_ISOCH_DIAG, TRUE, 0,
+           sizeof(EMU_ISOCH_DIAG_INFO));
+    CHECK_EQ(d.Action, EmuIoctlTestDiag);
+    CheckStatus("test-diag-exact", STATUS_SUCCESS, d.Status);
+    CHECK_EQ(d.OutputBytes, sizeof(EMU_ISOCH_DIAG_INFO));
+    Decide(&d, EMU_IOCTL_TEST_ISOCH_DIAG, TRUE, 4,
+           sizeof(EMU_ISOCH_DIAG_INFO));
+    CheckStatus("test-diag-with-input", STATUS_INVALID_PARAMETER, d.Status);
+    Decide(&d, EMU_IOCTL_TEST_ISOCH_DIAG, TRUE, 0,
+           sizeof(EMU_ISOCH_DIAG_INFO) - 1);
+    CheckStatus("test-diag-short-output", STATUS_BUFFER_TOO_SMALL, d.Status);
+    Decide(&d, EMU_IOCTL_TEST_ISOCH_DIAG, FALSE, 0,
+           sizeof(EMU_ISOCH_DIAG_INFO));
+    CHECK_EQ(d.Action, EmuIoctlReject);
+    CheckStatus("test-diag-not-ready", STATUS_DEVICE_NOT_READY, d.Status);
+
+    // The neighbouring function code stays foreign: 0x80A forward, the way
     // 0x802 with query access bits was already pinned.
-    Decide(&d, CTL_CODE(EMU_IOCTL_BASE, 0x809, METHOD_BUFFERED, FILE_READ_ACCESS),
+    Decide(&d, CTL_CODE(EMU_IOCTL_BASE, 0x80A, METHOD_BUFFERED, FILE_READ_ACCESS),
            TRUE, 0, sizeof(EMU_TEST_STREAM_STATS));
     CHECK_EQ(d.Action, EmuIoctlForward);
 }

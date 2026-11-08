@@ -52,6 +52,9 @@ EmuIoctlClassify(
     } else if (Call->ControlCode == EMU_IOCTL_TEST_STREAM_STATS) {
         action = EmuIoctlTestStats;
         required = sizeof(EMU_TEST_STREAM_STATS);
+    } else if (Call->ControlCode == EMU_IOCTL_TEST_ISOCH_DIAG) {
+        action = EmuIoctlTestDiag;
+        required = sizeof(EMU_ISOCH_DIAG_INFO);
     } else {
         // Everything else belongs to somebody else and goes back untouched.
         // That is not a courtesy: the FDO is PortCls's, and KS/wdmaud drive it
@@ -77,10 +80,10 @@ EmuIoctlClassify(
     // means the caller believes it is sending something this build does not
     // define, so it is refused instead of silently ignored - the same argument
     // that keeps unimplemented opcodes out of the header. TEST_STREAM_STATS
-    // reads the same way: the counters are the reply, there is no request to
-    // make of them.
+    // and TEST_ISOCH_DIAG read the same way: the ring is the reply, there is
+    // no request to make of it.
     if (action == EmuIoctlGetCaps || action == EmuIoctlGetState ||
-        action == EmuIoctlTestStats) {
+        action == EmuIoctlTestStats || action == EmuIoctlTestDiag) {
         if (Call->InputBufferLength != 0) {
             Decision->Action = EmuIoctlReject;
             Decision->Status = STATUS_INVALID_PARAMETER;

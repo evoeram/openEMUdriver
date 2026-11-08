@@ -82,6 +82,12 @@ DEFINE_GUID(GUID_DEVINTERFACE_EMUUSBAUDIO,
                                              FILE_WRITE_ACCESS)
 #define EMU_IOCTL_TEST_STREAM_STATS CTL_CODE(EMU_IOCTL_BASE, 0x808, METHOD_BUFFERED, \
                                              FILE_READ_ACCESS)
+// P1 capture diagnostics (docs/v3_plan.md): the recent per-URB wire history of
+// both engines - what was planned per packet, what actually arrived, and the
+// statuses in between. A measuring instrument like the codes above: not a
+// panel operation, no EMU_OP_ bit, removed from any release build.
+#define EMU_IOCTL_TEST_ISOCH_DIAG   CTL_CODE(EMU_IOCTL_BASE, 0x809, METHOD_BUFFERED, \
+                                             FILE_READ_ACCESS)
 
 // The SET input stage: the value only, never a unit id, control selector or
 // length — those stay the driver's business. Size/Version first, like every
@@ -219,6 +225,48 @@ typedef struct _EMU_TEST_STREAM_STATS {
 C_ASSERT(sizeof(EMU_TEST_STREAM_STATS) == 3 * sizeof(ULONG) +
          2 * 15 * sizeof(ULONG));
 
+// --- the isoch diagnostics reply (P1, test-only) -----------------------------
+//
+// One ring of recent per-URB records per direction. The kernel appends at
+// every data-URB completion and overwrites the oldest entries; the reader
+// stitches snapshots by the monotonic Seq. ULONG-only, like every reply here:
+// the same bytes in the driver, in this header's user-mode users, and in the
+// diagnostic tool. No audio content travels in it - lengths and statuses only.
+//
+// Rows[EMU_ISOCH_DIAG_ROWS-1] is the newest; a row with Seq == 0 was never
+// written (the stream has not completed that many URBs yet). Planned values
+// are what EmuIsochBuildSlot programmed; Actual is what the completion
+// reported. The pair is the whole point: a layout the stack or the device
+// refuses shows up as Planned != Actual long before any counter explains why.
+#define EMU_ISOCH_DIAG_ROWS 32
+
+typedef struct _EMU_ISOCH_DIAG_ROW {
+    ULONG Seq;                     // 1-based completion counter; 0 = unwritten
+    ULONG StartFrame;              // the URB's scheduled bus frame
+    ULONG IrpStatus;               // the completing IRP's IoStatus.Status
+    ULONG UrbStatus;               // _URB_HEADER.Status of the same URB
+    // Per packet p of the URB: [0] planned Offset, [1] planned Length (the
+    // capacity programmed at build), [2] actual Length (as completed),
+    // [3] the packet's USBD status.
+    ULONG P[2][4];
+} EMU_ISOCH_DIAG_ROW, *PEMU_ISOCH_DIAG_ROW;
+
+C_ASSERT(sizeof(EMU_ISOCH_DIAG_ROW) == 12 * sizeof(ULONG));
+
+typedef struct _EMU_ISOCH_DIAG_STREAM {
+    ULONG TotalSeq;                // completions recorded since the last start
+    EMU_ISOCH_DIAG_ROW Row[EMU_ISOCH_DIAG_ROWS];
+} EMU_ISOCH_DIAG_STREAM, *PEMU_ISOCH_DIAG_STREAM;
+
+typedef struct _EMU_ISOCH_DIAG_INFO {
+    ULONG Size;                    // sizeof(EMU_ISOCH_DIAG_INFO)
+    ULONG Version;                 // EMU_IOCTL_VERSION
+    EMU_ISOCH_DIAG_STREAM Stream[2];  // [0] render, [1] capture
+} EMU_ISOCH_DIAG_INFO, *PEMU_ISOCH_DIAG_INFO;
+
+C_ASSERT(sizeof(EMU_ISOCH_DIAG_INFO) == 2 * sizeof(ULONG) +
+         2 * sizeof(EMU_ISOCH_DIAG_STREAM));
+
 // --- what the driver makes of a request -------------------------------------
 
 typedef struct _EMU_IOCTL_CALL {
@@ -240,6 +288,7 @@ typedef enum _EMU_IOCTL_ACTION {
     EmuIoctlTestStart,   // M3 test slice, not a panel operation
     EmuIoctlTestStop,
     EmuIoctlTestStats,
+    EmuIoctlTestDiag,    // P1 isoch diagnostics, same standing as the above
     EmuIoctlReject       // ours, but refused; Status says why
 } EMU_IOCTL_ACTION;
 

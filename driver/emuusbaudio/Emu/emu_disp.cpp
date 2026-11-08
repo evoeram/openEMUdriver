@@ -77,7 +77,8 @@ static NTSTATUS EmuCompleteQuery(
         ExReleaseFastMutex(&Ctx->StateLock);
     } else if (Decision->Action == EmuIoctlTestStart ||
                Decision->Action == EmuIoctlTestStop ||
-               Decision->Action == EmuIoctlTestStats) {
+               Decision->Action == EmuIoctlTestStats ||
+               Decision->Action == EmuIoctlTestDiag) {
         // The M3 test slice. Unlike the panel SETs - which always complete
         // SUCCESS and carry their verdict in the state payload - a failed
         // start or stop completes with its real status: this is a measuring
@@ -95,7 +96,7 @@ static NTSTATUS EmuCompleteQuery(
         NTSTATUS         op = STATUS_SUCCESS;
         ULONG            rate = 0;
 
-        if (action != EmuIoctlTestStats) {
+        if (action != EmuIoctlTestStats && action != EmuIoctlTestDiag) {
             PEMU_SET_INPUT input = (PEMU_SET_INPUT)reply;
 
             if (input->Size != sizeof(EMU_SET_INPUT) ||
@@ -125,7 +126,15 @@ static NTSTATUS EmuCompleteQuery(
             }
             EmuNoteStatusValue(Ctx, L"TestStopStatus", (ULONG)STATUS_SUCCESS);
         }
-        EmuIsochFillStats((PEMU_TEST_STREAM_STATS)reply, Ctx);
+        if (action == EmuIoctlTestDiag) {
+            // Under the state lock like the stats path (the branch already
+            // holds it), though the ring itself needs none of it: rows are
+            // owned by the completing CPU until 32 further completions pass,
+            // and the diag carries its own sequencing.
+            EmuIsochFillDiag((PEMU_ISOCH_DIAG_INFO)reply, Ctx);
+        } else {
+            EmuIsochFillStats((PEMU_TEST_STREAM_STATS)reply, Ctx);
+        }
         ExReleaseFastMutex(&Ctx->StateLock);
 
         if (!NT_SUCCESS(op)) {

@@ -185,6 +185,163 @@ EmuIsochPickAltIndex(
     return wanted != Count ? wanted : first;
 }
 
+// The iso packet status lives in the USBD_STATUS namespace: signed LONG,
+// negative means error (usb.h's USBD_SUCCESS). Restated here because the pure
+// section links without usb.h, and the unit test runs the same rule in
+// user mode.
+static BOOLEAN
+EmuIsochPacketStatusOk(
+    _In_ ULONG Status
+    )
+{
+    return (BOOLEAN)(((LONG)Status) >= 0);
+}
+
+BOOLEAN
+EmuIsochPlanFixedNominal(
+    _In_ ULONG NominalFrames,
+    _In_ ULONG BytesPerFrame,
+    _In_ ULONG MaxPacketSize,
+    _In_ BOOLEAN Out,
+    _Out_ PULONG TransferBufferLength,
+    _Out_writes_(EMU_ISOCH_PKTS_PER_URB) PEMU_ISOCH_PACKET_PLAN Plan
+    )
+{
+    ULONG packetBytes;
+    ULONG bufferBytes;
+    ULONG p;
+
+    if (TransferBufferLength == NULL || Plan == NULL) {
+        return FALSE;
+    }
+    // Descriptor-shaped bounds: nothing a parsed alt can produce comes near
+    // them, and inside them every product below stays far from a ULONG wrap.
+    // (EmuIsochSlotBytes itself is unchecked on purpose - the start path
+    // feeds it real pipe facts - so the guard lives here, at the planner.)
+    if (NominalFrames < EMU_ISOCH_PKTS_PER_URB || NominalFrames > 4096 ||
+        BytesPerFrame == 0 || BytesPerFrame > 64 ||
+        MaxPacketSize == 0 || MaxPacketSize > 65536) {
+        return FALSE;
+    }
+
+    packetBytes = NominalFrames * BytesPerFrame;
+    bufferBytes = Out ? packetBytes
+                      : EmuIsochSlotBytes(NominalFrames, BytesPerFrame,
+                                          MaxPacketSize);
+    // The wire layout of the current engine, verbatim: the packet stride is
+    // the nominal audio of one packet, the per-packet length is half of the
+    // whole transfer buffer (payload bytes for OUT, capacity for IN). For a
+    // capture slot the two disagree whenever the slot holds headroom above
+    // the nominal audio - that is the P1 layout suspicion, kept byte-identical
+    // here until the hardware verdict (docs/v3_plan.md P1, ISOCH_PUMP.md).
+    *TransferBufferLength = bufferBytes;
+    for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
+        Plan[p].Offset = p * (packetBytes / EMU_ISOCH_PKTS_PER_URB);
+        Plan[p].Length = bufferBytes / EMU_ISOCH_PKTS_PER_URB;
+    }
+    return TRUE;
+}
+
+BOOLEAN
+EmuIsochValidateLayout(
+    _In_ ULONG TransferBufferLength,
+    _In_ ULONG MaxPacketSize,
+    _In_reads_(PacketCount) const EMU_ISOCH_PACKET_PLAN* Plan,
+    _In_ ULONG PacketCount,
+    _Out_ PULONG FirstBad
+    )
+{
+    ULONG prevEnd = 0;
+    ULONG i;
+
+    if (FirstBad == NULL) {
+        return FALSE;
+    }
+    *FirstBad = 0;
+    if (Plan == NULL || PacketCount == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < PacketCount; i++) {
+        ULONGLONG end = (ULONGLONG)Plan[i].Offset + (ULONGLONG)Plan[i].Length;
+
+        // The stack schedules what the descriptors say, packet by packet:
+        //   - a packet may not claim more than the endpoint's packet size
+        //     (the wire cannot carry it - the P1.2 capacity rule);
+        //   - the packet must end inside the transfer buffer;
+        //   - the packet must start at or after the end of the previous one:
+        //     iso descriptors are placed, not scattered, and two packets
+        //     claiming the same bytes is the overlap class (the P1 suspect).
+        // A zero-length packet is legal anywhere from the previous end
+        // onwards: an OUT tail that got no data, an IN capacity of zero.
+        if (Plan[i].Length > MaxPacketSize ||
+            end > (ULONGLONG)TransferBufferLength ||
+            Plan[i].Offset < prevEnd) {
+            *FirstBad = i;
+            return FALSE;
+        }
+        prevEnd = (ULONG)end;
+    }
+    *FirstBad = PacketCount;
+    return TRUE;
+}
+
+VOID
+EmuIsochEvaluateCompletion(
+    _In_ ULONG NominalFrames,
+    _In_ ULONG BytesPerFrame,
+    _In_ NTSTATUS IrpStatus,
+    _In_ NTSTATUS UrbStatus,
+    _In_reads_(EMU_ISOCH_PKTS_PER_URB) const ULONG* PacketLength,
+    _In_reads_(EMU_ISOCH_PKTS_PER_URB) const ULONG* PacketStatus,
+    _Out_ PEMU_ISOCH_COMPLETION_SUMMARY Summary
+    )
+{
+    ULONG total = 0;
+    ULONG errors = 0;
+    ULONG lastBad = 0;
+    ULONG p;
+
+    Summary->TotalBytes = 0;
+    Summary->ExpectedBytes = 0;
+    Summary->Short = FALSE;
+    Summary->PacketErrors = 0;
+    Summary->LastPacketStatus = 0;
+    Summary->UrbFailed = FALSE;
+    Summary->FailStatus = (NTSTATUS)0;
+    Summary->FramesTransferred = 0;
+
+    if (PacketLength == NULL || PacketStatus == NULL) {
+        return;
+    }
+
+    // Byte and error accounting, exactly as the harvest reads the completed
+    // descriptors: every packet's Length counts (a failed packet's partial
+    // bytes are just as gone from the schedule), every failing status is
+    // counted and remembered.
+    for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
+        total += PacketLength[p];
+        if (!EmuIsochPacketStatusOk(PacketStatus[p])) {
+            errors++;
+            lastBad = PacketStatus[p];
+        }
+    }
+    Summary->TotalBytes = total;
+    Summary->PacketErrors = errors;
+    Summary->LastPacketStatus = lastBad;
+    Summary->ExpectedBytes = NominalFrames * BytesPerFrame;
+    Summary->Short = (BOOLEAN)(total < Summary->ExpectedBytes);
+    Summary->UrbFailed = (BOOLEAN)(!NT_SUCCESS(IrpStatus) ||
+                                   !NT_SUCCESS(UrbStatus));
+    // The IRP verdict wins when both failed: it is the one the stack sets
+    // for cancellation and submission errors, and the harvest records it the
+    // same way.
+    Summary->FailStatus = !NT_SUCCESS(IrpStatus) ? IrpStatus : UrbStatus;
+    if (BytesPerFrame != 0) {
+        Summary->FramesTransferred = total / BytesPerFrame;
+    }
+}
+
 // --- engine ------------------------------------------------------------------
 
 #ifdef EMU_KERNEL
@@ -408,6 +565,37 @@ EmuIsochFrameRefresh(
     (VOID)EmuIsochQueryFrameReal(S, Ctx, &frame);
 }
 
+// The P1 diagnostics row: one per completed data URB, planned vs actual per
+// packet plus the verdicts. DPC-safe: the completion owns the slot exclusively
+// until the reap (the State exchange happens after this), so the URB and the
+// stored plan are stable; the row is claimed by an interlocked ticket, so two
+// CPUs completing in parallel never write one row; Seq is stored last with a
+// full barrier, which makes every earlier field visible to the reader that
+// sees it.
+static VOID
+EmuIsochDiagRecord(
+    _Inout_ PEMU_ISOCH_STREAM S,
+    _Inout_ PEMU_ISOCH_SLOT   Slot,
+    _In_    NTSTATUS          IrpStatus
+    )
+{
+    struct _URB_ISOCH_TRANSFER* u = &Slot->Urb->UrbIsochronousTransfer;
+    ULONG n = (ULONG)InterlockedIncrement(&S->DiagSeq);
+    PEMU_ISOCH_DIAG_ROW row = &S->Diag[(n - 1) % EMU_ISOCH_DIAG_ROWS];
+    ULONG p;
+
+    row->StartFrame = u->StartFrame;
+    row->IrpStatus = (ULONG)IrpStatus;
+    row->UrbStatus = (ULONG)u->Hdr.Status;
+    for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
+        row->P[p][0] = Slot->Plan[p].Offset;
+        row->P[p][1] = Slot->Plan[p].Length;
+        row->P[p][2] = u->IsoPacket[p].Length;
+        row->P[p][3] = (ULONG)u->IsoPacket[p].Status;
+    }
+    InterlockedExchange((volatile LONG*)&row->Seq, (LONG)n);
+}
+
 // Read one completed data URB into the counters. DPC-safe: interlocked
 // counters, the notification callback's spinlocks, no waits. The render
 // position advances by the frames the wire actually carried on EVERY
@@ -424,45 +612,51 @@ EmuIsochHarvest(
 {
     struct _URB_ISOCH_TRANSFER* u = &Slot->Urb->UrbIsochronousTransfer;
     BOOLEAN out = (S->Direction == EMU_STREAM_RENDER);
-    ULONG packetBytes = S->NominalFrames * S->BytesPerFrame;
-    LONGLONG completed;
-    ULONG got = 0;
+    ULONG lengths[EMU_ISOCH_PKTS_PER_URB];
+    ULONG statuses[EMU_ISOCH_PKTS_PER_URB];
+    EMU_ISOCH_COMPLETION_SUMMARY sum;
     ULONG p;
-    BOOLEAN irpSuccess = NT_SUCCESS(Slot->Irp->IoStatus.Status);
-    BOOLEAN urbSuccess = NT_SUCCESS((NTSTATUS)u->Hdr.Status);
+    LONGLONG completed;
 
     InterlockedIncrement(&S->Completes);
 
-    if (!irpSuccess || !urbSuccess) {
+    for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
+        lengths[p] = u->IsoPacket[p].Length;
+        statuses[p] = (ULONG)u->IsoPacket[p].Status;
+    }
+    EmuIsochEvaluateCompletion(S->NominalFrames, S->BytesPerFrame,
+                               Slot->Irp->IoStatus.Status,
+                               (NTSTATUS)u->Hdr.Status,
+                               lengths, statuses, &sum);
+
+    if (sum.UrbFailed) {
         InterlockedIncrement(&S->UrbFailures);
-        InterlockedExchange(&S->LastUrbStatus,
-                            !irpSuccess ? (LONG)Slot->Irp->IoStatus.Status
-                                        : (LONG)u->Hdr.Status);
+        InterlockedExchange(&S->LastUrbStatus, (LONG)sum.FailStatus);
         // A URB-level failure is a contract break, not a wire condition; a
         // run of them stops the stream (canceled completions at stop record
         // nothing — FailStop checks Quit). One broken URB can be a stack
         // hiccup; EMU_ISOCH_URB_FAIL_LIMIT in a row cannot.
         if (InterlockedIncrement(&S->UrbConsecErrors) >=
             EMU_ISOCH_URB_FAIL_LIMIT) {
-            EmuIsochFailStop(S, EMU_ISOCH_FAIL_URB,
-                             !irpSuccess ? Slot->Irp->IoStatus.Status
-                                         : (NTSTATUS)u->Hdr.Status);
+            EmuIsochFailStop(S, EMU_ISOCH_FAIL_URB, sum.FailStatus);
         }
     } else {
         InterlockedExchange(&S->UrbConsecErrors, 0);
     }
-    for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
-        if (!USBD_SUCCESS(u->IsoPacket[p].Status)) {
-            InterlockedIncrement(&S->IsoPacketErrors);
-            InterlockedExchange(&S->LastPacketStatus,
-                                (LONG)u->IsoPacket[p].Status);
-        }
-        got += u->IsoPacket[p].Length;
+    if (sum.PacketErrors > 0) {
+        InterlockedAdd(&S->IsoPacketErrors, (LONG)sum.PacketErrors);
+        InterlockedExchange(&S->LastPacketStatus, (LONG)sum.LastPacketStatus);
     }
-    if (got < packetBytes) {
+    if (sum.Short) {
         InterlockedIncrement(&S->ShortPackets);
     }
-    InterlockedAdd(&S->Bytes, (LONG)got);
+    InterlockedAdd(&S->Bytes, (LONG)sum.TotalBytes);
+
+    // The P1 wire history: what was planned, what arrived, with which status.
+    // Both directions record it - the same instrument serves the render runs
+    // and the capture investigation, and neither pays more than a few stores
+    // per completion.
+    EmuIsochDiagRecord(S, Slot, Slot->Irp->IoStatus.Status);
 
     if (out) {
         // The position advance is every completion, error or not: the device
@@ -477,7 +671,7 @@ EmuIsochHarvest(
         // Several slots can complete on different CPUs at once, so the
         // position advances interlocked; the callback gets the new total.
         completed = InterlockedAdd64(&S->CompletedFrames,
-                                     (LONGLONG)(got / S->BytesPerFrame));
+                                     (LONGLONG)sum.FramesTransferred);
         if (S->RenderCompleted != NULL) {
             S->RenderCompleted(S->CallbackContext, (ULONGLONG)completed);
         }
@@ -655,7 +849,6 @@ EmuIsochBuildSlot(
     struct _URB_ISOCH_TRANSFER* u = &Slot->Urb->UrbIsochronousTransfer;
     PUCHAR transferBuffer = S->Buffer +
         (ULONG)(Slot - &S->Slots[0]) * S->SlotBytes;
-    ULONG packetBytes = S->NominalFrames * S->BytesPerFrame;
     ULONG perPacket = S->NominalFrames / EMU_ISOCH_PKTS_PER_URB;
     ULONG p;
 
@@ -693,6 +886,10 @@ EmuIsochBuildSlot(
             u->IsoPacket[p].Offset = off;
             u->IsoPacket[p].Length = got * S->BytesPerFrame;
             u->IsoPacket[p].Status = 0;
+            // The diag record reads these after the completion: the planned
+            // shape of the URB as it left the builder.
+            Slot->Plan[p].Offset = off;
+            Slot->Plan[p].Length = got * S->BytesPerFrame;
             off += got * S->BytesPerFrame;
             frames += got;
         }
@@ -710,13 +907,24 @@ EmuIsochBuildSlot(
 
     // Capture and the probe path (no fill callback): fixed nominal layout.
     // An IN slot must be able to hold whatever the device sends; the probe
-    // buffer is pre-filled once and repeats every pipeline cycle.
-    u->TransferBufferLength = Out ? packetBytes : S->SlotBytes;
-    for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
-        u->IsoPacket[p].Offset = p * (packetBytes / EMU_ISOCH_PKTS_PER_URB);
-        u->IsoPacket[p].Length = (Out ? packetBytes : S->SlotBytes) /
-                                 EMU_ISOCH_PKTS_PER_URB;
-        u->IsoPacket[p].Status = 0;
+    // buffer is pre-filled once and repeats every pipeline cycle. The layout
+    // comes from the tested planner, byte-identical to the inline version it
+    // replaced, so the P1 wire behavior does not move under the diagnostics.
+    {
+        EMU_ISOCH_PACKET_PLAN plan[EMU_ISOCH_PKTS_PER_URB];
+        ULONG ttl;
+
+        if (!EmuIsochPlanFixedNominal(S->NominalFrames, S->BytesPerFrame,
+                                      S->MaxPacketSize, Out, &ttl, plan)) {
+            return FALSE;
+        }
+        u->TransferBufferLength = ttl;
+        for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
+            u->IsoPacket[p].Offset = plan[p].Offset;
+            u->IsoPacket[p].Length = plan[p].Length;
+            u->IsoPacket[p].Status = 0;
+            Slot->Plan[p] = plan[p];
+        }
     }
     if (Out) {
         S->SubmittedFrames += S->NominalFrames;
@@ -1623,6 +1831,13 @@ EmuIsochStartStream(
     S->PumpPoolExit = 0;
     S->PumpGateExit = 0;
     S->PumpBuildExit = 0;
+    // The P1 wire history starts empty per run: rows keep the previous
+    // session's data until the next start, so a stop - planned or failed -
+    // can be read afterwards, but no session ever sees another's rows.
+    for (i = 0; i < EMU_ISOCH_DIAG_ROWS; i++) {
+        S->Diag[i].Seq = 0;
+    }
+    S->DiagSeq = 0;
 
     // Calibrate the counter units: query twice across 10 ms of interrupt
     // time. Millisecond frames give delta 10; a microframe-based counter
@@ -1972,6 +2187,48 @@ EmuIsochFillStats(
             (ULONG)InterlockedCompareExchange(&S->LastUrbStatus, 0, 0);
         e->LastPacketStatus =
             (ULONG)InterlockedCompareExchange(&S->LastPacketStatus, 0, 0);
+    }
+}
+// The diag reply: both engines' wire history, oldest live entry first. Rows
+// the ring has already turned over since a snapshot was requested are simply
+// absent (their Seq shows the newest epoch instead of the expected one); a
+// row captured mid-write is skipped rather than published torn. No lock: the
+// completion routines own their rows until 32 further completions have passed.
+VOID
+EmuIsochFillDiag(
+    _Out_ PEMU_ISOCH_DIAG_INFO Out,
+    _In_ PEMU_DEVICE_CONTEXT     Ctx
+    )
+{
+    PAGED_CODE();
+
+    RtlZeroMemory(Out, sizeof(*Out));
+    Out->Size = sizeof(EMU_ISOCH_DIAG_INFO);
+    Out->Version = EMU_IOCTL_VERSION;
+
+    for (ULONG d = 0; d < 2; d++) {
+        PEMU_ISOCH_STREAM        S = &Ctx->Isoch[d];
+        PEMU_ISOCH_DIAG_STREAM   dst = &Out->Stream[d];
+        // A negative counter means the 2^31-completion wrap (years of a
+        // stressed run); the snapshot answers empty rather than walking a
+        // wrapped sequence backwards.
+        LONG  last = InterlockedCompareExchange(&S->DiagSeq, 0, 0);
+        ULONG count = last > 0 ? (ULONG)last : 0;
+        ULONG first = count > EMU_ISOCH_DIAG_ROWS
+                          ? count - EMU_ISOCH_DIAG_ROWS + 1
+                          : 1;
+
+        dst->TotalSeq = count;
+        for (ULONG s = first; s <= count; s++) {
+            PEMU_ISOCH_DIAG_ROW src = &S->Diag[(s - 1) % EMU_ISOCH_DIAG_ROWS];
+            PEMU_ISOCH_DIAG_ROW cell = &dst->Row[s - first];
+
+            if (src->Seq == (LONG)s) {
+                *cell = *src;
+            }
+            // A mismatching Seq is a row from an older or a not-yet-written
+            // epoch; leaving it zeroed says "no sample", never garbage.
+        }
     }
 }
 #pragma code_seg()
