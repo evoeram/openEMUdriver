@@ -29,7 +29,11 @@ param(
     [switch]$Uninstall,
     [switch]$Rollback,
     [string]$Sys,
-    [string]$Inf
+    [string]$Inf,
+    # The one certificate thumbprint used for both the .sys and the .cat.
+    # Optional while the subject matches exactly one certificate; mandatory
+    # (the run stops) as soon as the store holds several with the same subject.
+    [string]$Thumbprint
 )
 
 $ErrorActionPreference = 'Stop'
@@ -166,6 +170,16 @@ if ($Build) {
 }
 if (-not (Test-Path $Sys)) { throw "$Sys not found - build first (./kinstall.ps1 -Build)." }
 if (-not (Test-Path $Inf)) { throw "$Inf not found." }
+
+# P0.2: resolve the signing certificate once, before anything is staged, and
+# pass its thumbprint to both signing operations (.sys and .cat) so they can
+# never diverge. A missing or ambiguous certificate stops here, before any
+# package state changes.
+. (Join-Path $drvDir 'ksign-lib.ps1')
+$signCert = Resolve-SigningCertificate -Candidates (Get-SigningCandidates) `
+    -Thumbprint $Thumbprint -Subject "CN=openEMUdriver Test Signing"
+Write-Host "signing certificate: $($signCert.Thumbprint) [$((Get-CertStoreLocation $signCert))\My]"
+
 if (-not (Test-Admin)) {
     Write-Host "not elevated: staging, Inf2Cat and signing still run; the pnputil step at the end will fail."
 }
@@ -181,8 +195,9 @@ $stagedInf = Join-Path $pkgDir (Split-Path $Inf -Leaf)
 
 # sign the binary before the catalog exists, then the catalog itself: the
 # conventional driver-package order, and it avoids any question about whether
-# the appended signature changes the hashes Inf2Cat recorded.
-& $ksign -File $stagedSys
+# the appended signature changes the hashes Inf2Cat recorded. Both with the
+# same explicitly resolved thumbprint.
+& $ksign -File $stagedSys -Thumbprint $signCert.Thumbprint
 
 $inf2cat = Find-KitTool 'Inf2Cat.exe'
 Remove-Item (Join-Path $pkgDir '*.cat') -Force -ErrorAction SilentlyContinue
@@ -196,7 +211,7 @@ $stagedCat = Join-Path $pkgDir (Get-Content $stagedInf |
     Select-String -Pattern '^\s*CatalogFile\w*\s*=\s*(\S+)' |
     ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
 if (-not (Test-Path $stagedCat)) { throw "Inf2Cat produced no catalog at $stagedCat." }
-& $ksign -File $stagedCat
+& $ksign -File $stagedCat -Thumbprint $signCert.Thumbprint
 
 # --- install ---------------------------------------------------------------
 if (-not (Test-Admin)) { throw "pnputil /add-driver needs an elevated shell." }

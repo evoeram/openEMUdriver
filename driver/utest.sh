@@ -15,6 +15,11 @@
 #      tests/<unit>test.cpp into build/<unit>test.exe and the cases are executed.
 #      Each binary prints "RESULT: PASS" or "RESULT: FAIL".
 #
+# The PowerShell side (unit "ps", driver/tests/run-ps-tests.ps1) is not a C++
+# unit: it covers ksign-lib.ps1 certificate-selection logic and the
+# ksign.ps1/kinstall.ps1 wiring, runs only when the units run (RUN=1) and is
+# not affected by the unit filter. It is counted as one more test binary.
+#
 # A unit can need more than one source: the cache in Emu/emu_state.cpp decides
 # what to believe from the tables Emu/emu_desc.cpp produced, so its binary links
 # both and the test runs against a parsed descriptor instead of a hand-written
@@ -112,6 +117,21 @@ for u in $WANT; do
         "$DRV/build/emu_${u}test.exe" || FAILED=$((FAILED + 1))
     fi
 done
+
+# --- 3. PowerShell-side tests -------------------------------------------------
+# Signing/certificate logic (ksign-lib.ps1) and the ksign/kinstall wiring, on
+# fabricated certificate objects - no store, no admin, no signing happens here.
+if [ "$RUN" = "1" ]; then
+    RAN=$((RAN + 1))
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        echo "UTEST: powershell.exe not found - the ps unit cannot run" >&2
+        FAILED=$((FAILED + 1))
+    else
+        echo "=== ps: ksign/kinstall certificate logic"
+        powershell.exe -NoProfile -ExecutionPolicy Bypass \
+            -File "$(w "$SCRIPT_DIR/tests/run-ps-tests.ps1")" || FAILED=$((FAILED + 1))
+    fi
+fi
 
 if [ "$RUN" = "1" ]; then
     if [ "$FAILED" -ne 0 ]; then
