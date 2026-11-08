@@ -105,6 +105,25 @@ EmuIsochSlotBytes(
     return want > MaxPacketSize ? want : MaxPacketSize;
 }
 
+ULONG
+EmuIsochCaptureSlotBytes(
+    _In_ ULONG NominalFrames,
+    _In_ ULONG BytesPerFrame,
+    _In_ ULONG MaxPacketSize
+    )
+{
+    ULONG want = EmuIsochSlotBytes(NominalFrames, BytesPerFrame, MaxPacketSize);
+    // Two full-size packets must tile the slot without overlapping. The wire
+    // verdict of 2026-11-08: a 300-byte slot against MPS 154 planned
+    // [0,150)+[144,294) - the controller babbled the first descriptor and
+    // delivered 148 bytes into the second, every URB. Nominal-plus-headroom
+    // sizing covers ONE packet of the pipe maximum; a capture slot has to
+    // cover both.
+    ULONG both = MaxPacketSize * EMU_ISOCH_PKTS_PER_URB;
+
+    return both > want ? both : want;
+}
+
 LONG
 EmuIsochCursorAnchor(
     _In_ ULONG  Now,
@@ -225,18 +244,19 @@ EmuIsochPlanFixedNominal(
     }
 
     packetBytes = NominalFrames * BytesPerFrame;
+    // OUT: the buffer holds exactly the URB's audio payload. IN: a capture
+    // slot tiles two non-overlapping capacities of up to the pipe maximum
+    // (EmuIsochCaptureSlotBytes) - the pre-fix slot claimed [0,150)+[144,294)
+    // and the controller babbled the first descriptor (2026-11-08 verdict).
     bufferBytes = Out ? packetBytes
-                      : EmuIsochSlotBytes(NominalFrames, BytesPerFrame,
-                                          MaxPacketSize);
-    // The wire layout of the current engine, verbatim: the packet stride is
-    // the nominal audio of one packet, the per-packet length is half of the
-    // whole transfer buffer (payload bytes for OUT, capacity for IN). For a
-    // capture slot the two disagree whenever the slot holds headroom above
-    // the nominal audio - that is the P1 layout suspicion, kept byte-identical
-    // here until the hardware verdict (docs/v3_plan.md P1, ISOCH_PUMP.md).
+                      : EmuIsochCaptureSlotBytes(NominalFrames, BytesPerFrame,
+                                                 MaxPacketSize);
+    // The descriptor stride follows the buffer, not the nominal audio: every
+    // packet occupies its contiguous half. For OUT the buffer IS the nominal
+    // audio, so this reproduces the old render numbers byte for byte.
     *TransferBufferLength = bufferBytes;
     for (p = 0; p < EMU_ISOCH_PKTS_PER_URB; p++) {
-        Plan[p].Offset = p * (packetBytes / EMU_ISOCH_PKTS_PER_URB);
+        Plan[p].Offset = p * (bufferBytes / EMU_ISOCH_PKTS_PER_URB);
         Plan[p].Length = bufferBytes / EMU_ISOCH_PKTS_PER_URB;
     }
     return TRUE;
@@ -248,6 +268,7 @@ EmuIsochValidateLayout(
     _In_ ULONG MaxPacketSize,
     _In_reads_(PacketCount) const EMU_ISOCH_PACKET_PLAN* Plan,
     _In_ ULONG PacketCount,
+    _In_ BOOLEAN In,
     _Out_ PULONG FirstBad
     )
 {
@@ -266,15 +287,19 @@ EmuIsochValidateLayout(
         ULONGLONG end = (ULONGLONG)Plan[i].Offset + (ULONGLONG)Plan[i].Length;
 
         // The stack schedules what the descriptors say, packet by packet:
-        //   - a packet may not claim more than the endpoint's packet size
-        //     (the wire cannot carry it - the P1.2 capacity rule);
+        //   - an OUT packet may not claim more than the endpoint's packet
+        //     size (its Length IS the wire payload); an IN descriptor's
+        //     Length is a receive capacity - the device sends what it sends
+        //     (148-byte packets against the 0404's MPS 154), so the MPS rule
+        //     is deliberately not applied to capture;
         //   - the packet must end inside the transfer buffer;
         //   - the packet must start at or after the end of the previous one:
         //     iso descriptors are placed, not scattered, and two packets
-        //     claiming the same bytes is the overlap class (the P1 suspect).
+        //     claiming the same bytes is the overlap class the controller
+        //     answered with USBD_STATUS_BABBLE_DETECTED on 2026-11-08.
         // A zero-length packet is legal anywhere from the previous end
         // onwards: an OUT tail that got no data, an IN capacity of zero.
-        if (Plan[i].Length > MaxPacketSize ||
+        if ((!In && Plan[i].Length > MaxPacketSize) ||
             end > (ULONGLONG)TransferBufferLength ||
             Plan[i].Offset < prevEnd) {
             *FirstBad = i;
@@ -1693,8 +1718,13 @@ EmuIsochStartStream(
     S->NominalFrames = S->FramesPerPacket;
     S->PeriodMs = 1;   // legacy breadcrumb field
     S->BytesPerFrame = Alt->Channels * Alt->SubFrameSize;
-    S->SlotBytes = EmuIsochSlotBytes(S->NominalFrames, S->BytesPerFrame,
-                                     S->MaxPacketSize);
+    // OUT holds the pump's payload; IN must tile two full-size capacities -
+    // the 2026-11-08 wire verdict (BABBLE on the overlapped first descriptor).
+    S->SlotBytes = out ? EmuIsochSlotBytes(S->NominalFrames, S->BytesPerFrame,
+                                           S->MaxPacketSize)
+                       : EmuIsochCaptureSlotBytes(S->NominalFrames,
+                                                  S->BytesPerFrame,
+                                                  S->MaxPacketSize);
 
     // The boot-session verdict reads these: raw interval, derived period and
     // the pipe's maximum, packed into one DWORD per direction.

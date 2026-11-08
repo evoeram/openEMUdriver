@@ -334,6 +334,19 @@ EmuIsochSlotBytes(
     _In_ ULONG MaxPacketSize
     );
 
+// Per-slot buffer size for a CAPTURE slot: two non-overlapping packet
+// capacities of up to the pipe's maximum each (the wire verdict of
+// 2026-11-08 - the nominal-plus-headroom slot left the second IN descriptor
+// eating into the first, and the controller babbled the pair away; see
+// docs/ISOCH_PUMP.md §12). The render sizing above is untouched: OUT slots
+// carry payloads the pump fills, not device-controlled sizes.
+ULONG
+EmuIsochCaptureSlotBytes(
+    _In_ ULONG NominalFrames,
+    _In_ ULONG BytesPerFrame,
+    _In_ ULONG MaxPacketSize
+    );
+
 // The anchor rule, pure so the test checks the exact numbers the engine arms
 // with. A cursor at or behind Now re-anchors to Now + EMU_ISOCH_FRAME_MARGIN
 // (the vendor's 0x4DBE invariant); a cursor that leads Now by more than
@@ -396,20 +409,24 @@ EmuIsochPlanFixedNominal(
     );
 
 // The contract a two-packet isochronous layout must satisfy for the Windows
-// USB stack to schedule it: packets inside the transfer buffer, inside the
-// endpoint's packet size, monotonically placed and not overlapping. This is
-// the driver's restatement of the USBD_ISO_PACKET_DESCRIPTOR rules (P1.2) -
-// an executable specification the unit test pins, not a run-time gate: the
-// builder does not consult it yet, so the P1 wire behavior stays frozen while
-// the diagnostics run. Violations are reported per packet: FirstBad is the
-// 0-based index of the first packet that breaks a rule, or PacketCount when
-// the layout is clean.
+// USB stack to schedule it: packets inside the transfer buffer, monotonically
+// placed and not overlapping, and - for OUT, whose lengths are wire payloads -
+// never larger than the endpoint's packet size. An IN descriptor's Length is a
+// receive capacity, not a wire claim: the device sends what it sends (the
+// 0404's 148-byte packets against a 154-byte MPS), so the MPS rule does not
+// apply to capture capacities. This is the driver's restatement of the
+// USBD_ISO_PACKET_DESCRIPTOR rules (P1.2) - an executable specification the
+// unit test pins, not a run-time gate: the builder does not consult it yet,
+// so the wire behavior stays frozen while the diagnostics run. Violations are
+// reported per packet: FirstBad is the 0-based index of the first packet that
+// breaks a rule, or PacketCount when the layout is clean.
 BOOLEAN
 EmuIsochValidateLayout(
     _In_ ULONG TransferBufferLength,
     _In_ ULONG MaxPacketSize,
     _In_reads_(PacketCount) const EMU_ISOCH_PACKET_PLAN* Plan,
     _In_ ULONG PacketCount,
+    _In_ BOOLEAN In,
     _Out_ PULONG FirstBad
     );
 

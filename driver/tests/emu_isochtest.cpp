@@ -196,6 +196,24 @@ static void CasePickAlt(void)
     CHECK_EQ(EmuIsochPickAltIndex(alts, 2, EMU_STREAM_RENDER, 1, 48000), 2);
 }
 
+static void CaseCaptureSlotBytes(void)
+{
+    g_case = "capture-slot-bytes";
+    // The 0404 48 kHz IN alt: MPS 154. The pre-fix nominal-plus-headroom slot
+    // was 300 and could not tile two full-size capacities - the 2026-11-08
+    // wire verdict (BABBLE on the first overlapped descriptor). A capture
+    // slot must hold two packets of the pipe maximum.
+    CHECK_EQ(EmuIsochCaptureSlotBytes(48, 6, 154), 308);
+    CHECK_EQ(EmuIsochCaptureSlotBytes(48, 6, 288), 576);
+    CHECK_EQ(EmuIsochCaptureSlotBytes(48, 6, 4096), 8192);
+    // The nominal rule still wins when it is the larger one: a small-packet
+    // endpoint keeps the headroom sizing.
+    CHECK_EQ(EmuIsochCaptureSlotBytes(48, 6, 100), 300);
+    // Render sizing is untouched by this rule.
+    CHECK_EQ(EmuIsochSlotBytes(48, 6, 288), 300);
+    CHECK_EQ(EmuIsochSlotBytes(48, 6, 512), 512);
+}
+
 static void CasePlanFixedNominal(void)
 {
     EMU_ISOCH_PACKET_PLAN plan[2];
@@ -213,7 +231,7 @@ static void CasePlanFixedNominal(void)
     CHECK_EQ(plan[1].Length, 144);
     {
         ULONG bad = 99;
-        CHECK(EmuIsochValidateLayout(288, 298, plan, 2, &bad));
+        CHECK(EmuIsochValidateLayout(288, 298, plan, 2, FALSE, &bad));
         CHECK_EQ(bad, 2);
     }
     // An odd frame count splits floor-wise: 49 frames * 6 = 294, halves 147,
@@ -225,37 +243,46 @@ static void CasePlanFixedNominal(void)
     CHECK_EQ(plan[1].Offset, 147);
     CHECK_EQ(plan[1].Length, 147);
 
-    // The capture path: capacities out of EmuIsochSlotBytes (nominal plus two
-    // headroom frames, at least the pipe maximum) but the descriptor STRIDE
-    // still comes from the nominal audio. On the 0404's 48 kHz IN alt
-    // (MPS 154) the slot is 300 bytes, so each packet claims 150 while the
-    // second one starts at 144: a 6-byte overlap. This is the P1 layout
-    // suspicion (docs/v3_plan.md, ISOCH_PUMP.md) pinned as a fact of the
-    // current builder until the hardware verdict; when the layout is fixed
-    // these three lines change with it.
+    // The capture path: two non-overlapping capacities of up to the pipe
+    // maximum each (the fix of the 2026-11-08 BABBLE verdict). On the 0404's
+    // 48 kHz IN alt (MPS 154) the slot is 308 and the descriptors tile it
+    // exactly; the device's real packets (148 bytes) fit either descriptor.
     CHECK(EmuIsochPlanFixedNominal(48, 6, 154, FALSE, &ttl, plan));
-    CHECK_EQ(ttl, 300);
+    CHECK_EQ(ttl, 308);
     CHECK_EQ(plan[0].Offset, 0);
-    CHECK_EQ(plan[0].Length, 150);
-    CHECK_EQ(plan[1].Offset, 144);
-    CHECK_EQ(plan[1].Length, 150);
+    CHECK_EQ(plan[0].Length, 154);
+    CHECK_EQ(plan[1].Offset, 154);
+    CHECK_EQ(plan[1].Length, 154);
     {
         ULONG bad = 99;
 
-        CHECK(!EmuIsochValidateLayout(300, 154, plan, 2, &bad));
-        CHECK_EQ(bad, 1);
+        CHECK(EmuIsochValidateLayout(308, 154, plan, 2, TRUE, &bad));
+        CHECK_EQ(bad, 2);
     }
-    // The same divergence with an oversized pipe: capacities grow with the
-    // slot, the stride does not - the overlap is structural, not an accident
-    // of one MPS.
+    // An oversized pipe scales both capacities and the stride together.
     CHECK(EmuIsochPlanFixedNominal(48, 6, 4096, FALSE, &ttl, plan));
-    CHECK_EQ(ttl, 4096);
-    CHECK_EQ(plan[0].Length, 2048);
-    CHECK_EQ(plan[1].Offset, 144);
+    CHECK_EQ(ttl, 8192);
+    CHECK_EQ(plan[0].Length, 4096);
+    CHECK_EQ(plan[1].Offset, 4096);
     {
         ULONG bad = 99;
 
-        CHECK(!EmuIsochValidateLayout(4096, 4096, plan, 2, &bad));
+        CHECK(EmuIsochValidateLayout(8192, 4096, plan, 2, TRUE, &bad));
+        CHECK_EQ(bad, 2);
+    }
+
+    // The pre-fix layout, reconstructed by hand, stays a validator rejection:
+    // stride from the nominal audio (144) with capacities from the old slot
+    // (150) overlapped the descriptors, and the controller babbled packet 0
+    // on every URB (hardware, 2026-11-08).
+    CHECK(EmuIsochPlanFixedNominal(48, 6, 100, FALSE, &ttl, plan));
+    {
+        EMU_ISOCH_PACKET_PLAN legacy[2];
+        ULONG bad = 99;
+
+        legacy[0].Offset = 0;   legacy[0].Length = 150;
+        legacy[1].Offset = 144; legacy[1].Length = 150;
+        CHECK(!EmuIsochValidateLayout(300, 154, legacy, 2, TRUE, &bad));
         CHECK_EQ(bad, 1);
     }
 
@@ -279,37 +306,44 @@ static void CaseValidateLayout(void)
     // Clean contiguous pair.
     plan[0].Offset = 0;   plan[0].Length = 144;
     plan[1].Offset = 144; plan[1].Length = 144;
-    CHECK(EmuIsochValidateLayout(288, 154, plan, 2, &bad));
+    CHECK(EmuIsochValidateLayout(288, 154, plan, 2, FALSE, &bad));
     CHECK_EQ(bad, 2);
     // A gap between packets is fine: the OS hands the ring over in whole
     // packets, but nothing in the contract requires them back to back.
     plan[1].Offset = 256;
-    CHECK(EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK(EmuIsochValidateLayout(400, 154, plan, 2, FALSE, &bad));
     CHECK_EQ(bad, 2);
-    // Overlap: the second packet starts before the first ends - the P1
-    // suspect class. The failing packet is named.
+    // Overlap: the second packet starts before the first ends - the class the
+    // controller answered with USBD_STATUS_BABBLE_DETECTED (2026-11-08).
     plan[1].Offset = 100;
-    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, FALSE, &bad));
+    CHECK_EQ(bad, 1);
+    // The overlap rule does not care about direction.
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, TRUE, &bad));
     CHECK_EQ(bad, 1);
     // Beyond the transfer buffer: the stack would DMA past the allocation.
     plan[1].Offset = 392;
     plan[1].Length = 16;
-    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, FALSE, &bad));
     CHECK_EQ(bad, 1);
-    // Packet larger than the endpoint's maximum: not wire-legal, whatever the
-    // buffer holds.
+    // An OUT payload larger than the endpoint's maximum is not wire-legal.
     plan[1].Offset = 144;
     plan[1].Length = 155;
-    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, FALSE, &bad));
     CHECK_EQ(bad, 1);
+    // ...but an IN capacity above MPS is deliberately accepted: the Length is
+    // how much the descriptor would take, and the device sends what it sends
+    // (148 against the 0404's MPS 154 was the observed shape).
+    CHECK(EmuIsochValidateLayout(400, 154, plan, 2, TRUE, &bad));
+    CHECK_EQ(bad, 2);
     // Zero-length tail packets are legal, exactly at the previous end.
     plan[1].Length = 0;
-    CHECK(EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK(EmuIsochValidateLayout(400, 154, plan, 2, FALSE, &bad));
     CHECK_EQ(bad, 2);
     // ...but a zero-length packet placed behind the previous end is a
     // placement error all the same.
     plan[1].Offset = 100;
-    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, FALSE, &bad));
     CHECK_EQ(bad, 1);
     // The offset arithmetic must not wrap: 0xFFFFFFFF + 1 exceeds any buffer
     // without a 32-bit overflow saying otherwise.
@@ -317,12 +351,12 @@ static void CaseValidateLayout(void)
     plan[0].Length = 1;
     plan[1].Offset = 0;
     plan[1].Length = 0;
-    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, FALSE, &bad));
     CHECK_EQ(bad, 0);
     // An empty or absent plan is not a layout.
-    CHECK(!EmuIsochValidateLayout(400, 154, plan, 0, &bad));
-    CHECK(!EmuIsochValidateLayout(400, 154, NULL, 2, &bad));
-    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, NULL));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 0, FALSE, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, NULL, 2, FALSE, &bad));
+    CHECK(!EmuIsochValidateLayout(400, 154, plan, 2, FALSE, NULL));
 }
 
 static void CaseEvaluateCompletion(void)
@@ -425,6 +459,7 @@ int main(void)
     CasePeriod();
     CaseNominal();
     CaseSlotBytes();
+    CaseCaptureSlotBytes();
     CaseCursorAnchor();
     CaseFramesPerMs();
     CasePickAlt();
